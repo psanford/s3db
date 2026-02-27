@@ -63,9 +63,9 @@ Each stage should be independently testable before moving on. Order is chosen so
 
 ```go
 type BlobStore interface {
-    Get(ctx context.Context, key string) (body []byte, etag string, err error)
+    Get(ctx context.Context, key string) (body io.ReadCloser, etag string, err error)
     Head(ctx context.Context, key string) (etag string, err error)
-    Put(ctx context.Context, key string, body []byte, cond PutCondition) (etag string, err error)
+    Put(ctx context.Context, key string, body io.Reader, cond PutCondition) (etag string, err error)
     List(ctx context.Context, prefix string) (keys []string, err error)
     Delete(ctx context.Context, key string) error
     DeletePrefix(ctx context.Context, prefix string) error
@@ -77,7 +77,9 @@ type PutCondition struct {
 }
 ```
 
-`blob_mem.go` implements this with `map[string]entry{body, etag}` + mutex. ETags are content hashes (same behavior as S3 for non-multipart). `Put` with `IfMatch` returns a distinguishable "precondition failed" error.
+`Get` returns a stream so snapshots can be copied directly to disk without buffering. `Put` takes a reader; the body may be partially consumed on error, but this is fine for our protocols — manifests are rebuilt (not retried) on CAS failure, and changesets/snapshots use unique keys so never contend.
+
+`blob_mem.go` implements this with `map[string]entry{body, etag}` + mutex. It drains readers into memory (unavoidable for a map-backed store). ETags are content hashes (same behavior as S3 for non-multipart). `Put` with `IfMatch` returns a distinguishable "precondition failed" error.
 
 **Tests:** Put/Get roundtrip, CAS success/failure, IfNoneMatch race, List prefix filtering, DeletePrefix.
 

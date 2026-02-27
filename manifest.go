@@ -1,6 +1,7 @@
 package s3db
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -125,13 +126,14 @@ func (m *Manifest) WithSnapshot(snapshot BlobRef) *Manifest {
 // loadManifest fetches and parses the manifest from the store. It validates
 // the result before returning.
 func loadManifest(ctx context.Context, store BlobStore, key string) (*Manifest, string, error) {
-	body, etag, err := store.Get(ctx, key)
+	rc, etag, err := store.Get(ctx, key)
 	if err != nil {
 		return nil, "", err
 	}
+	defer rc.Close()
 	var m Manifest
-	if err := json.Unmarshal(body, &m); err != nil {
-		return nil, "", fmt.Errorf("manifest: unmarshal: %w", err)
+	if err := json.NewDecoder(rc).Decode(&m); err != nil {
+		return nil, "", fmt.Errorf("manifest: decode: %w", err)
 	}
 	if err := m.Validate(); err != nil {
 		return nil, "", err
@@ -150,5 +152,5 @@ func putManifest(ctx context.Context, store BlobStore, key string, m *Manifest, 
 	if err != nil {
 		return "", fmt.Errorf("manifest: marshal: %w", err)
 	}
-	return store.Put(ctx, key, body, cond)
+	return store.Put(ctx, key, bytes.NewReader(body), cond)
 }

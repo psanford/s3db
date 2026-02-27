@@ -3,7 +3,10 @@
 // for the architecture.
 package s3db
 
-import "context"
+import (
+	"context"
+	"io"
+)
 
 // BlobStore is the storage abstraction. Production uses S3; tests use an
 // in-memory fake. All operations are key-scoped — the store has no concept
@@ -15,17 +18,22 @@ import "context"
 //   - ETag-based compare-and-swap via PutCondition.IfMatch
 //   - Write-if-not-exists via PutCondition.IfNoneMatch
 type BlobStore interface {
-	// Get retrieves the body and ETag of the object at key.
-	// Returns ErrNotFound if the key does not exist.
-	Get(ctx context.Context, key string) (body []byte, etag string, err error)
+	// Get retrieves the object at key. The caller is responsible for
+	// closing the returned reader. Returns ErrNotFound if the key does
+	// not exist.
+	Get(ctx context.Context, key string) (body io.ReadCloser, etag string, err error)
 
 	// Head returns the ETag of the object at key without fetching the body.
 	// Returns ErrNotFound if the key does not exist.
 	Head(ctx context.Context, key string) (etag string, err error)
 
-	// Put writes body to key, subject to cond. Returns the new ETag on success.
-	// Returns ErrPreconditionFailed if cond is not met.
-	Put(ctx context.Context, key string, body []byte, cond PutCondition) (etag string, err error)
+	// Put writes body to key, subject to cond. The body reader is drained
+	// by the store. Returns the new ETag on success, ErrPreconditionFailed
+	// if cond is not met.
+	//
+	// The body may be partially or fully consumed before an error is
+	// returned. Callers that need to retry must supply a fresh reader.
+	Put(ctx context.Context, key string, body io.Reader, cond PutCondition) (etag string, err error)
 
 	// List returns all keys with the given prefix, in lexicographic order.
 	List(ctx context.Context, prefix string) (keys []string, err error)

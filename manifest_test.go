@@ -1,6 +1,7 @@
 package s3db
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -275,11 +276,11 @@ func TestLoadManifest_NotFound(t *testing.T) {
 func TestLoadManifest_InvalidJSON(t *testing.T) {
 	s := NewMemBlobStore()
 	ctx := context.Background()
-	s.Put(ctx, "m", []byte("not json"), NoCondition)
+	s.Put(ctx, "m", strings.NewReader("not json"), NoCondition)
 
 	_, _, err := loadManifest(ctx, s, "m")
-	if err == nil || !strings.Contains(err.Error(), "unmarshal") {
-		t.Errorf("expected unmarshal error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "decode") {
+		t.Errorf("expected decode error, got %v", err)
 	}
 }
 
@@ -289,7 +290,7 @@ func TestLoadManifest_InvalidManifest(t *testing.T) {
 
 	bad := &Manifest{Seq: 99, Snapshot: BlobRef{Key: "x", Seq: 5}} // seq mismatch
 	data, _ := json.Marshal(bad)
-	s.Put(ctx, "m", data, NoCondition)
+	s.Put(ctx, "m", bytes.NewReader(data), NoCondition)
 
 	_, _, err := loadManifest(ctx, s, "m")
 	if err == nil || !strings.Contains(err.Error(), "does not match") {

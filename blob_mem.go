@@ -1,7 +1,9 @@
 package s3db
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -32,7 +34,7 @@ func NewMemBlobStore() *MemBlobStore {
 	}
 }
 
-func (m *MemBlobStore) Get(ctx context.Context, key string) ([]byte, string, error) {
+func (m *MemBlobStore) Get(ctx context.Context, key string) (io.ReadCloser, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
@@ -43,10 +45,9 @@ func (m *MemBlobStore) Get(ctx context.Context, key string) ([]byte, string, err
 	if !ok {
 		return nil, "", ErrNotFound
 	}
-	// Return a copy so callers cannot mutate stored data.
-	out := make([]byte, len(e.body))
-	copy(out, e.body)
-	return out, e.etag, nil
+	// bytes.Reader never mutates its backing slice, so the stored body is
+	// safe from callers. No explicit copy needed.
+	return io.NopCloser(bytes.NewReader(e.body)), e.etag, nil
 }
 
 func (m *MemBlobStore) Head(ctx context.Context, key string) (string, error) {
@@ -63,10 +64,19 @@ func (m *MemBlobStore) Head(ctx context.Context, key string) (string, error) {
 	return e.etag, nil
 }
 
-func (m *MemBlobStore) Put(ctx context.Context, key string, body []byte, cond PutCondition) (string, error) {
+func (m *MemBlobStore) Put(ctx context.Context, key string, body io.Reader, cond PutCondition) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
+
+	// Drain the reader before taking the lock. This mirrors S3 behavior
+	// (upload happens before precondition evaluation on the server) and
+	// avoids holding the lock during potentially-slow reads.
+	stored, err := io.ReadAll(body)
+	if err != nil {
+		return "", err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -85,9 +95,6 @@ func (m *MemBlobStore) Put(ctx context.Context, key string, body []byte, cond Pu
 		}
 	}
 
-	// Copy body so caller mutations after Put don't affect stored data.
-	stored := make([]byte, len(body))
-	copy(stored, body)
 	newETag := etag.Compute(stored)
 	m.objects[key] = memEntry{body: stored, etag: newETag}
 	return newETag, nil
