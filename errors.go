@@ -24,6 +24,11 @@ var (
 	// of the migrations this client knows about. Upgrade your code.
 	ErrSchemaTooNew = errors.New("s3db: database schema is newer than this client supports")
 
+	// ErrSeqMismatch is returned by Push when expectedSeq does not match
+	// the current manifest seq, indicating the database has advanced
+	// since the caller last pulled.
+	ErrSeqMismatch = errors.New("s3db: sequence mismatch (concurrent write detected)")
+
 	// errBothConditions is returned when PutCondition has both IfMatch
 	// and IfNoneMatch set.
 	errBothConditions = errors.New("s3db: PutCondition: both IfMatch and IfNoneMatch set")
