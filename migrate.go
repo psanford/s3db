@@ -40,6 +40,12 @@ func (db *DB) runMigrations(ctx context.Context) error {
 		maxVer = migs[len(migs)-1].Version
 	}
 
+	// lastAttemptedVer tracks which migration version we last tried to
+	// apply. If we try the same version again (CAS lost to a regular
+	// writer, schema_version unchanged), we need a full refresh to
+	// discard the dirty local state from the previous Up() run.
+	lastAttemptedVer := -1
+
 	for {
 		// Re-check the manifest at the top of each loop iteration — a
 		// concurrent migrator may have advanced schema_version while we
@@ -75,7 +81,13 @@ func (db *DB) runMigrations(ctx context.Context) error {
 				m.SchemaVersion, maxVer)
 		}
 
-		if err := db.applyMigration(ctx, m, etag, next); err != nil {
+		// A migration is retried when the CAS loser was a regular writer
+		// (schema_version unchanged, same mig selected again). Force a
+		// full refresh on retry to discard the dirty already-ran-Up state.
+		forceRefresh := next.Version == lastAttemptedVer
+		lastAttemptedVer = next.Version
+
+		if err := db.applyMigration(ctx, m, etag, next, forceRefresh); err != nil {
 			if errors.Is(err, ErrPreconditionFailed) {
 				// Someone else advanced the manifest. Loop back to re-check.
 				continue
@@ -90,17 +102,22 @@ func (db *DB) runMigrations(ctx context.Context) error {
 // snapshot, CAS manifest with bumped schema_version. Returns
 // ErrPreconditionFailed if the CAS loses (caller should re-check and retry
 // or skip).
-func (db *DB) applyMigration(ctx context.Context, m *manifest, etag string, mig *Migration) error {
-	// Force a full refresh: discard whatever is in the local file and
-	// re-download the snapshot. This is essential for correctness on CAS
-	// retry — if a regular writer (not a concurrent migrator) committed
-	// between our syncToManifest and manifest CAS, the snapshot key is
-	// unchanged, so the incremental sync path would keep our dirty
-	// already-ran-Up local state and run Up AGAIN on top of it. Clearing
-	// snapshotKey forces the needRefresh branch in syncToManifest.
+//
+// The forceRefresh flag triggers a full snapshot re-download before running
+// Up. This is REQUIRED on CAS retry (when a regular writer committed between
+// our sync and CAS — see issue #1) but wasteful on the first attempt when
+// local state is already clean.
+func (db *DB) applyMigration(ctx context.Context, m *manifest, etag string, mig *Migration, forceRefresh bool) error {
 	db.st.manifest = m
 	db.st.etag = etag
-	db.st.snapshotKey = "" // force full refresh
+	if forceRefresh {
+		// Discard whatever is in the local file. If the CAS loser was a
+		// regular writer (not a concurrent migrator), the snapshot key
+		// is unchanged, so incremental sync would keep our dirty
+		// already-ran-Up local state. Clearing snapshotKey forces the
+		// needRefresh branch in syncToManifest.
+		db.st.snapshotKey = ""
+	}
 	if err := syncToManifest(ctx, &db.cfg, &db.st, db.localPath); err != nil {
 		return err
 	}

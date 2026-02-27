@@ -651,6 +651,99 @@ func TestView_InterruptOnContextCancel(t *testing.T) {
 	}
 }
 
+// refreshFailStore fails Get calls for snapshot keys but allows manifest
+// and changeset reads. Used to trigger a download failure during a full
+// refresh.
+type refreshFailStore struct {
+	*MemBlobStore
+	failSnapshots bool
+}
+
+func (s *refreshFailStore) Get(ctx context.Context, key string) (io.ReadCloser, string, error) {
+	if s.failSnapshots && strings.Contains(key, "snapshots/") {
+		return nil, "", errors.New("injected snapshot download failure")
+	}
+	return s.MemBlobStore.Get(ctx, key)
+}
+
+func (s *refreshFailStore) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error) {
+	if s.failSnapshots && strings.Contains(key, "snapshots/") {
+		return nil, errors.New("injected snapshot download failure")
+	}
+	return s.MemBlobStore.GetRange(ctx, key, start, end)
+}
+
+func TestUpdate_RefreshFailureDoesNotPanic(t *testing.T) {
+	// Regression test for issue #23: if a full-refresh during doUpdate
+	// fails after closing the conn (e.g. snapshot download error), the
+	// withInterrupt defer must NOT panic calling SetInterrupt on the
+	// closed conn. Instead Update should return the error cleanly.
+	ctx := context.Background()
+	inner := NewMemBlobStore()
+	seedSchema(t, inner, "mydb/")
+
+	// DB 1 will be the victim.
+	db1, err := Open(ctx, inner, "mydb/")
+	if err != nil {
+		t.Fatalf("Open db1: %v", err)
+	}
+	defer db1.Close()
+
+	// Seed a row so there's something to compact.
+	db1.Update(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (1, 'x')`, nil)
+	})
+
+	// DB 2 compacts — this changes the snapshot key. When db1 next tries
+	// to Update and gets a 412, it will need a full refresh.
+	db2, err := Open(ctx, inner, "mydb/")
+	if err != nil {
+		t.Fatalf("Open db2: %v", err)
+	}
+	if err := db2.Compact(ctx); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	// Write once more so db1's CAS will 412.
+	db2.Update(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (2, 'y')`, nil)
+	})
+	db2.Close()
+
+	// Wrap db1's store to fail snapshot downloads. The Update will:
+	//   1. CAS → 412 (db2 advanced the manifest)
+	//   2. See new snapshot key → rollbackAndResync → syncToManifest
+	//   3. syncToManifest: needRefresh=true → close conn → download FAILS
+	//   4. Error propagates → withInterrupt's defer fires → must NOT panic
+	//
+	// Before the fix, step 4 would panic because st.conn pointed at the
+	// closed connection. Now syncToManifest nils it, and the defer checks.
+	db1.cfg.store = &refreshFailStore{MemBlobStore: inner, failSnapshots: true}
+
+	// Catch panics so we can report them as test failures rather than
+	// crashing the whole test run.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("Update panicked: %v", r)
+		}
+	}()
+
+	err = db1.Update(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (3, 'z')`, nil)
+	})
+	if err == nil {
+		t.Fatal("expected error from failed refresh, got nil")
+	}
+	if strings.Contains(err.Error(), "closed") {
+		t.Errorf("error mentions 'closed' — probably the panic path: %v", err)
+	}
+	t.Logf("Update returned error cleanly: %v", err)
+
+	// db1's conn should be nil (failed refresh). Close should not panic.
+	if err := db1.Close(); err != nil {
+		t.Logf("Close returned: %v", err) // not necessarily an error
+	}
+}
+
 func TestGC_GracePeriod(t *testing.T) {
 	// Snapshots younger than the grace period should survive GC even
 	// if they're no longer referenced by the manifest.

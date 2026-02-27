@@ -364,15 +364,22 @@ func openLocalConn(path string) (*sqlite.Conn, error) {
 // withInterrupt plumbs ctx cancellation to the SQLite connection for the
 // duration of fn. SetInterrupt is reset on whatever conn is current when
 // fn returns — not the one that was current at entry — because fn may
-// have replaced st.conn via a full-refresh (close+download+reopen). This
-// matters: calling SetInterrupt on a closed conn panics.
+// have replaced st.conn via a full-refresh (close+download+reopen).
 //
-// If fn itself replaces conn mid-execution (e.g. during a full refresh in
-// doUpdate), the new conn will NOT have interrupt set until the next call.
-// This is acceptable: the window is brief and the network operations
-// during refresh honour ctx independently.
+// If fn returns an error during a full refresh (download or reopen failed),
+// st.conn may be nil — the defer checks for this. Calling SetInterrupt on
+// a closed (non-nil) conn panics, but syncToManifest nils the conn before
+// attempting download/reopen so we never see a closed non-nil conn here.
+//
+// If fn replaces conn mid-execution (e.g. full refresh in doUpdate), the
+// new conn will NOT have interrupt set until the next call. Acceptable:
+// the window is brief and network operations honour ctx independently.
 func (db *DB) withInterrupt(ctx context.Context, fn func() error) error {
 	db.st.conn.SetInterrupt(ctx.Done())
-	defer func() { db.st.conn.SetInterrupt(nil) }()
+	defer func() {
+		if db.st.conn != nil {
+			db.st.conn.SetInterrupt(nil)
+		}
+	}()
 	return fn()
 }

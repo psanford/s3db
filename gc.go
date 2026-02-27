@@ -41,6 +41,8 @@ func (db *DB) GC(ctx context.Context) error {
 		liveChangesets[e.Key] = struct{}{}
 	}
 	currentEpoch := m.epoch()
+	grace := db.opts.gcGracePeriod
+	now := time.Now()
 
 	// Sweep changeset epochs. List all keys under changesets/, group by
 	// epoch prefix, delete any epoch that (a) is not the current epoch
@@ -69,7 +71,17 @@ func (db *DB) GC(ctx context.Context) error {
 		if hasLive {
 			continue
 		}
-		// Entire epoch is garbage.
+		// Entire epoch is unreferenced. Check grace period before
+		// deleting — a reader who loaded an old manifest (pointing at
+		// these changesets) may still be fetching them. Stat the first
+		// key as a representative; changesets in an epoch are uploaded
+		// within seconds of each other, so one age check suffices.
+		if grace > 0 && len(epochKeys) > 0 {
+			info, serr := db.cfg.store.Stat(ctx, epochKeys[0])
+			if serr != nil || now.Sub(info.LastModified) < grace {
+				continue // can't stat, or too young
+			}
+		}
 		epochPrefix := csPrefix + epoch + "/"
 		if err := db.cfg.store.DeletePrefix(ctx, epochPrefix); err != nil {
 			return fmt.Errorf("gc: delete epoch %s: %w", epoch, err)
@@ -85,8 +97,6 @@ func (db *DB) GC(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("gc: list snapshots: %w", err)
 	}
-	grace := db.opts.gcGracePeriod
-	now := time.Now()
 	for _, k := range snapKeys {
 		if k == m.Snapshot.Key {
 			continue

@@ -51,6 +51,11 @@ func syncToManifest(ctx context.Context, cfg *commitConfig, st *commitState, loc
 		if err := st.conn.Close(); err != nil {
 			return fmt.Errorf("sync: close for refresh: %w", err)
 		}
+		// Nil out the closed conn immediately. If download or reopen
+		// fails below, st.conn must NOT point at a closed connection —
+		// callers (e.g. withInterrupt's defer) may call methods on it
+		// that panic on closed conns. A nil conn is explicitly checked.
+		st.conn = nil
 		if err := downloadSnapshot(ctx, cfg.store, m.Snapshot.Key, m.Snapshot.Size, localPath); err != nil {
 			return err
 		}
@@ -267,8 +272,12 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 		needCapture = true
 	}
 
-	// Exhausted retries. Ensure any open SAVEPOINT is rolled back by
-	// setting err before the deferred release fires.
+	// Exhausted retries. Clean up the final orphan (best effort — GC is
+	// the fallback). Ensure any open SAVEPOINT is rolled back by setting
+	// err before the deferred release fires.
+	if orphan != "" {
+		_ = cfg.store.Delete(ctx, orphan)
+	}
 	err = ErrConflict
 	return err
 }
