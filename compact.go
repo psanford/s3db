@@ -80,6 +80,7 @@ func (db *DB) compactLocked(ctx context.Context) error {
 		if err == nil {
 			db.st.manifest = newManifest
 			db.st.etag = newEtag
+			db.st.snapshotKey = snapKey
 			// localSeq already equals newManifest.Seq (we synced before).
 			return nil
 		}

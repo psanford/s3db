@@ -130,26 +130,24 @@ func Open(ctx context.Context, store BlobStore, prefix string, opts ...Option) (
 			schemaVer:   schemaVer,
 		},
 		st: commitState{
-			conn:     conn,
-			localSeq: localSeq,
-			manifest: m,
-			etag:     etag,
+			conn:        conn,
+			localSeq:    localSeq,
+			snapshotKey: m.Snapshot.Key,
+			manifest:    m,
+			etag:        etag,
 		},
 		localPath:    localPath,
 		opts:         o,
 		ownLocalFile: ownLocalFile,
 	}
 
-	// Run pending migrations. This is stubbed for now (Stage 8); the
-	// options are wired but the runner is a no-op until migrate.go exists.
-	// Schema-version checking in Update still works — if migrations are
-	// registered but not yet applied, Update will fail with
-	// ErrSchemaMismatch, which is the correct behavior.
-	if len(o.migrations) > 0 {
-		if err := db.migrate(ctx); err != nil {
-			db.Close()
-			return nil, err
-		}
+	// Run pending migrations. Each migration is a forced compaction —
+	// the Up function runs on the local DB, the result becomes a new
+	// snapshot, and the manifest CAS bumps schema_version. Safe under
+	// concurrent Open: the CAS loser sees the bumped version and skips.
+	if err := db.runMigrations(ctx); err != nil {
+		db.Close()
+		return nil, err
 	}
 
 	return db, nil
@@ -296,22 +294,4 @@ func (db *DB) Seq() int64 {
 // DELETE journal mode (the SQLite default) keeps everything in one file.
 func openLocalConn(path string) (*sqlite.Conn, error) {
 	return sqlite.OpenConn(path, sqlite.OpenReadWrite)
-}
-
-// --- Stubs for Stage 8 -----------------------------------------------------
-
-// migrate is a placeholder for Stage 8. For now it just validates that
-// migrations have increasing version numbers — the schema-version guard
-// in refreshManifest/Update still works correctly.
-func (db *DB) migrate(ctx context.Context) error {
-	_ = ctx
-	last := 0
-	for _, m := range db.opts.migrations {
-		if m.Version <= last {
-			return fmt.Errorf("s3db: migrations must have strictly increasing versions, got %d after %d", m.Version, last)
-		}
-		last = m.Version
-	}
-	// TODO Stage 8: actually run pending migrations
-	return nil
 }

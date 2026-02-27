@@ -75,10 +75,11 @@ func newTestEnv(t *testing.T) *testEnv {
 			schemaVer:   0,
 		},
 		st: &commitState{
-			conn:     conn,
-			localSeq: 0,
-			manifest: m,
-			etag:     etag,
+			conn:        conn,
+			localSeq:    0,
+			snapshotKey: snapKey,
+			manifest:    m,
+			etag:        etag,
 		},
 		localPath: localPath,
 	}
@@ -540,7 +541,7 @@ func TestDoUpdate_ConcurrentIncrements(t *testing.T) {
 				store: store, prefix: "mydb/", manifestKey: "mydb/manifest.json",
 				maxRetries: 100, // high — we expect lots of contention
 			},
-			st:        &commitState{conn: conn, localSeq: 0, manifest: mm, etag: etag},
+			st:        &commitState{conn: conn, localSeq: 0, snapshotKey: snapKey, manifest: mm, etag: etag},
 			localPath: localPath,
 		}
 	}

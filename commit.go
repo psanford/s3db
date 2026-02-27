@@ -15,10 +15,11 @@ import (
 // struct (Stage 6) will embed this; for now it's passed explicitly to keep
 // the commit loop testable before DB exists.
 type commitState struct {
-	conn     *sqlite.Conn // local SQLite connection
-	localSeq int64        // seq that conn is currently at
-	manifest *Manifest    // last-seen manifest
-	etag     string       // ETag of last-seen manifest
+	conn        *sqlite.Conn // local SQLite connection
+	localSeq    int64        // seq that conn is currently at
+	snapshotKey string       // which snapshot conn was loaded from
+	manifest    *Manifest    // last-seen manifest
+	etag        string       // ETag of last-seen manifest
 }
 
 // commitConfig holds the immutable parameters for a commit.
@@ -31,16 +32,22 @@ type commitConfig struct {
 }
 
 // syncToManifest brings st.conn up to the state described by st.manifest.
-// Handles both the incremental case (localSeq >= snapshot.seq, apply log
-// tail) and the full-refresh case (localSeq < snapshot.seq, download
-// snapshot and replay full log).
+// Handles both the incremental case (same snapshot, apply log tail) and
+// the full-refresh case (different snapshot or localSeq behind snapshot,
+// download snapshot and replay full log).
+//
+// A full refresh is needed when:
+//   - localSeq < snapshot.seq (compaction advanced the snapshot), or
+//   - snapshotKey != manifest.snapshot.key (migration swapped the snapshot
+//     without advancing seq)
 //
 // The full-refresh path requires closing and reopening conn, so this may
 // replace st.conn.
 func syncToManifest(ctx context.Context, cfg *commitConfig, st *commitState, localPath string) error {
 	m := st.manifest
 
-	if st.localSeq < m.Snapshot.Seq {
+	needRefresh := st.localSeq < m.Snapshot.Seq || st.snapshotKey != m.Snapshot.Key
+	if needRefresh {
 		if err := st.conn.Close(); err != nil {
 			return fmt.Errorf("sync: close for refresh: %w", err)
 		}
@@ -53,6 +60,7 @@ func syncToManifest(ctx context.Context, cfg *commitConfig, st *commitState, loc
 		}
 		st.conn = conn
 		st.localSeq = m.Snapshot.Seq
+		st.snapshotKey = m.Snapshot.Key
 	}
 
 	seq, err := applyLog(ctx, cfg.store, st.conn, m.Log, st.localSeq)
