@@ -171,36 +171,13 @@ func Open(ctx context.Context, store BlobStore, prefix string, opts ...Option) (
 // concurrent callers via If-None-Match on the manifest — exactly one
 // bootstrap succeeds; others fall back to loading the winner's manifest.
 func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string) (*manifest, string, error) {
-	// Build an empty SQLite file in a temp location.
-	tmp, err := os.CreateTemp("", "s3db-bootstrap-*.sqlite")
-	if err != nil {
-		return nil, "", err
-	}
-	tmpPath := tmp.Name()
-	tmp.Close()
-	defer os.Remove(tmpPath)
-
-	// OpenConn with OpenCreate doesn't write the file header until the
-	// first operation. Run a no-op PRAGMA to force it — otherwise the
-	// snapshot is 0 bytes, which collides with our Size=0-means-unknown
-	// convention and is also a bit weird to have as a valid SQLite file.
-	conn, err := sqlite.OpenConn(tmpPath, sqlite.OpenReadWrite|sqlite.OpenCreate)
-	if err != nil {
-		return nil, "", fmt.Errorf("bootstrap: create empty db: %w", err)
-	}
-	if err := sqlitex.Execute(conn, "PRAGMA user_version = 0", nil); err != nil {
-		conn.Close()
-		return nil, "", fmt.Errorf("bootstrap: init header: %w", err)
-	}
-	conn.Close()
-
 	// Upload the empty snapshot. This key is deterministic (no UUID) so
 	// concurrent bootstraps write the same content to the same key — the
 	// second PUT is a harmless overwrite of identical bytes.
 	snapKey := prefix + "snapshots/snap-init.sqlite"
-	snapSize, err := uploadFile(ctx, store, snapKey, tmpPath)
+	snapSize, err := uploadEmptySQLite(ctx, store, snapKey)
 	if err != nil {
-		return nil, "", fmt.Errorf("bootstrap: upload snapshot: %w", err)
+		return nil, "", fmt.Errorf("bootstrap: %w", err)
 	}
 
 	// CAS the manifest with If-None-Match.
@@ -219,6 +196,34 @@ func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string)
 		return nil, "", fmt.Errorf("bootstrap: put manifest: %w", err)
 	}
 	return m, etag, nil
+}
+
+// uploadEmptySQLite builds a valid empty SQLite database in a temp file
+// and uploads it to the store at key. Returns the uploaded size.
+//
+// The temp file is always cleaned up. "Empty" means no user tables, just
+// the SQLite header — OpenCreate doesn't write the header until the first
+// operation, so we run a no-op PRAGMA to force it.
+func uploadEmptySQLite(ctx context.Context, store BlobStore, key string) (int64, error) {
+	tmp, err := os.CreateTemp("", "s3db-empty-*.sqlite")
+	if err != nil {
+		return 0, err
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	conn, err := sqlite.OpenConn(tmpPath, sqlite.OpenReadWrite|sqlite.OpenCreate)
+	if err != nil {
+		return 0, fmt.Errorf("create empty db: %w", err)
+	}
+	if err := sqlitex.Execute(conn, "PRAGMA user_version = 0", nil); err != nil {
+		conn.Close()
+		return 0, fmt.Errorf("init header: %w", err)
+	}
+	conn.Close()
+
+	return uploadFile(ctx, store, key, tmpPath)
 }
 
 // View runs fn against the current database state, inside a read-only

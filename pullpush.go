@@ -10,6 +10,74 @@ import (
 	"zombiezen.com/go/sqlite"
 )
 
+// Init creates a new database at the given prefix. If srcPath is non-empty,
+// that SQLite file becomes the initial snapshot; otherwise an empty database
+// is created.
+//
+// Returns an error wrapping ErrPreconditionFailed if a database already
+// exists at the prefix. Safe under concurrent callers — exactly one Init
+// succeeds; others see ErrPreconditionFailed.
+//
+// Init does NOT validate that srcPath's schema matches any migrations —
+// it just uploads the bytes. If your application uses migrations, either
+// Init with srcPath="" and let the first Open run them, or be aware that
+// the resulting manifest will have schema_version=0.
+func Init(ctx context.Context, store BlobStore, prefix, srcPath string) error {
+	if !strings.HasSuffix(prefix, "/") {
+		return fmt.Errorf("s3db: prefix must end with /, got %q", prefix)
+	}
+
+	manifestKey := prefix + "manifest.json"
+
+	// Pre-check: if the manifest already exists, fail fast before doing
+	// any uploads. The If-None-Match on putManifest below is the real
+	// guard (covers races); this just avoids orphaning a snapshot blob
+	// in the common "oops, already exists" case.
+	if _, err := store.Stat(ctx, manifestKey); err == nil {
+		return fmt.Errorf("init: database already exists at %s: %w", prefix, ErrPreconditionFailed)
+	} else if !errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("init: stat manifest: %w", err)
+	}
+
+	var snapKey string
+	var snapSize int64
+
+	if srcPath != "" {
+		// Initialize from the given file.
+		if err := validateSQLiteFile(srcPath); err != nil {
+			return fmt.Errorf("init: %w", err)
+		}
+		snapKey = fmt.Sprintf("%ssnapshots/snap-init-%s.sqlite", prefix, uuid.NewString())
+		var err error
+		snapSize, err = uploadFile(ctx, store, snapKey, srcPath)
+		if err != nil {
+			return fmt.Errorf("init: upload snapshot: %w", err)
+		}
+	} else {
+		// Empty DB. Reuse bootstrap's empty-file creation, but handle
+		// the manifest CAS ourselves so we can report "already exists"
+		// consistently (bootstrap swallows the race and re-loads).
+		snapKey = prefix + "snapshots/snap-init.sqlite"
+		var err error
+		snapSize, err = uploadEmptySQLite(ctx, store, snapKey)
+		if err != nil {
+			return fmt.Errorf("init: %w", err)
+		}
+	}
+
+	m := &manifest{
+		Seq:      0,
+		Snapshot: blobRef{Key: snapKey, Seq: 0, Size: snapSize},
+	}
+	if _, err := putManifest(ctx, store, manifestKey, m, PutCondition{IfNoneMatch: true}); err != nil {
+		if errors.Is(err, ErrPreconditionFailed) {
+			return fmt.Errorf("init: database already exists at %s (concurrent init): %w", prefix, err)
+		}
+		return fmt.Errorf("init: put manifest: %w", err)
+	}
+	return nil
+}
+
 // PullInfo describes the state of a pulled database file. Pass Seq to Push
 // to guard against overwriting concurrent changes.
 type PullInfo struct {

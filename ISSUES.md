@@ -455,3 +455,121 @@ The `.seq` sidecar file is a nice workflow touch.
 **No new panics, no correctness bugs.** The two Medium items are #30 (quality
 of life — DB should self-heal after transient download failure) and #32
 (CLI unusable on any migrated DB — real blocker for the CLI's utility).
+
+---
+
+# Fourth Review: After 530c3b3 (2026-02-27)
+
+Single commit: `530c3b3 "Fix third-review issues #30-35"`.
+
+All tests pass, `-race` clean, `go vet` clean. Build has trailing newline
+restored. The fixes are all well-executed.
+
+## Verification of Third-Review Fixes
+
+| # | Issue | Status | Notes |
+|---|---|---|---|
+| 30 | DB stuck after failed refresh | **Fixed** — now self-healing | `st.conn == nil` added to `needRefresh` condition (`commit.go:51`); nil-check before `Close()` (`commit.go:56`). `TestUpdate_RefreshFailureDoesNotPanic` extended to verify: swap store back to working one, retry Update, verify it succeeds and write is visible. |
+| 31 | GC changeset grace uses upload time | **Fixed correctly** | Epoch sweep gated on **current snapshot's** age (`gc.go:56-62`) — exactly the suggested fix. One `Stat` per GC run instead of per-epoch. Comment explains the insight: snapshot age = time since last compaction = lower bound on how long anything has been garbage. |
+| 32 | CLI fails on migrated DBs | **Fixed** | New `WithSchemaUnchecked()` option; CLI status/compact/gc use it. `TestWithSchemaUnchecked` verifies Open succeeds on v3 DB, Stats/Compact/GC/View all work. Docstring is honest about the risk and the concurrent-migration edge case. |
+| 33 | CLI `-grace 0` means default | **Fixed** | Default now `-1`; check is `>= 0`. `-grace 0` explicitly disables grace. |
+| 34 | Push uses `==` not `errors.Is` | **Fixed** | `pullpush.go:118` |
+| 35 | Missing trailing newline | **Fixed** | `s3db.go:398` |
+
+## Remaining Observation (new)
+
+### 36. Snapshot grace check still uses upload time, not garbage time
+
+**Severity**: Low (same as #31 was)
+**Location**: `gc.go:109-128`
+
+The #31 fix corrected the grace semantics for **changeset epochs** by checking
+the current snapshot's age (= time since last compaction). But the **snapshot
+sweep** (`gc.go:109-128`) still uses the per-snapshot `LastModified`:
+
+```go
+for _, k := range snapKeys {
+    if k == m.Snapshot.Key { continue }
+    if grace > 0 {
+        info, err := db.cfg.store.Stat(ctx, k)
+        ...
+        if now.Sub(info.LastModified) < grace { continue }  // wrong timestamp
+    }
+    // delete
+}
+```
+
+A snapshot uploaded at T-20min that was **replaced** at T-30s (via compaction)
+has `LastModified = T-20min`. The check sees 20min > grace (5min) and deletes,
+even though the snapshot only **became garbage** 30 seconds ago — a reader
+who loaded the old manifest at T-1min still points at it.
+
+Same fix as #31 applies: gate the snapshot sweep on the same `sweepEpochs`
+check (current snapshot's age). In fact, since `sweepEpochs` already encodes
+"the most recent compaction was long enough ago", both sweeps could share it:
+
+```go
+if !sweepEpochs {
+    return nil  // nothing became garbage recently enough to safely delete
+}
+// ...epoch sweep...
+// ...snapshot sweep...
+```
+
+**Why this is only Low**:
+- The `sweepEpochs` check already protects against the MOST dangerous case
+  (GC immediately after Compact — current snapshot is young → sweepEpochs=false
+  → epochs preserved, and the only dangerous old snapshot is the
+  just-replaced one, which IS young per its own LastModified). The gap only
+  opens when there are MULTIPLE compactions within a grace window plus an
+  older snapshot from before.
+- The race window is milliseconds (time between `loadManifest` and the start
+  of `downloadSnapshot`).
+- Failure mode is a clear 404 on `Open`, trivially retryable.
+
+**Inconsistency rather than bug**: #31 and this issue are the same flaw;
+fixing one but not the other is just incomplete.
+
+## Assessment of Fix Quality
+
+**#30 (self-heal)** — the fix goes beyond the minimal "add nil check" I
+suggested. The `st.conn == nil` addition to `needRefresh` means a DB whose
+refresh failed will automatically retry the full download on the next
+operation. The test verifies the full round-trip: fail, recover, write,
+read back. This is the right user experience.
+
+**#31 (GC grace)** — implemented exactly as suggested. The comment at
+`gc.go:46-55` is a clear explanation of why snapshot-age-as-proxy is
+correct ("lower bound on how long anything has been garbage"). Good
+transfer of the design rationale into code comments.
+
+**#32 (WithSchemaUnchecked)** — I suggested three options; option (a) was
+chosen (admin-mode flag). The docstring at `options.go:92-108` is honest
+about the risks ("Do NOT use this for regular application code") and the
+concurrent-migration edge ("the adopted version is frozen at Open time").
+The test explicitly documents that View/Update still work under
+schemaUnchecked (lines 942-949 of s3db_test.go), with a comment explaining
+the intentional design. Nothing hidden.
+
+## Summary
+
+| # | Issue | Severity | Status |
+|---|---|---|---|
+| 30 | DB stuck after failed refresh | — | **Fixed (self-healing)** |
+| 31 | GC changeset grace semantics | — | **Fixed** |
+| 32 | CLI on migrated DBs | — | **Fixed** |
+| 33 | CLI `-grace 0` | — | **Fixed** |
+| 34 | `errors.Is` | — | **Fixed** |
+| 35 | Trailing newline | — | **Fixed** |
+| 36 | Snapshot grace still uses upload time | **Low** | Inconsistency with #31's fix; 2-line gate to unify |
+
+**No new bugs. No regressions. One remaining inconsistency (#36) that is
+low-impact and the same fix pattern as #31.**
+
+At this point the codebase is in good shape. Across four review rounds:
+- 22 original issues → all fixed
+- 7 re-review issues → all fixed
+- 6 third-review issues → all fixed
+- 1 remaining Low-severity inconsistency
+
+No outstanding Critical, High, or Medium issues.

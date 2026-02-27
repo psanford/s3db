@@ -312,3 +312,124 @@ func (s *pushInterposingStore) Put(ctx context.Context, key string, body io.Read
 	}
 	return s.MemBlobStore.Put(ctx, key, body, cond)
 }
+
+
+// --- Init --------------------------------------------------------------------
+
+func TestInit_Empty(t *testing.T) {
+	store := NewMemBlobStore()
+	ctx := context.Background()
+
+	if err := Init(ctx, store, "mydb/", ""); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Manifest should exist at seq 0.
+	m, _, err := loadManifest(ctx, store, "mydb/manifest.json")
+	if err != nil {
+		t.Fatalf("loadManifest: %v", err)
+	}
+	if m.Seq != 0 {
+		t.Errorf("Seq = %d, want 0", m.Seq)
+	}
+	if m.SchemaVersion != 0 {
+		t.Errorf("SchemaVersion = %d, want 0", m.SchemaVersion)
+	}
+
+	// Should be openable.
+	db, err := Open(ctx, store, "mydb/")
+	if err != nil {
+		t.Fatalf("Open after Init: %v", err)
+	}
+	db.Close()
+}
+
+func TestInit_FromFile(t *testing.T) {
+	store := NewMemBlobStore()
+	ctx := context.Background()
+
+	// Build a SQLite file with some data.
+	srcPath := filepath.Join(t.TempDir(), "src.sqlite")
+	conn, _ := sqlite.OpenConn(srcPath, sqlite.OpenReadWrite|sqlite.OpenCreate)
+	sqlitex.ExecuteScript(conn, `
+		CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);
+		INSERT INTO items (id, name) VALUES (1, 'hello'), (2, 'world');
+	`, nil)
+	conn.Close()
+
+	if err := Init(ctx, store, "mydb/", srcPath); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Pull and verify the data is there.
+	pullPath := filepath.Join(t.TempDir(), "pulled.sqlite")
+	info, err := Pull(ctx, store, "mydb/", pullPath)
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if info.Seq != 0 {
+		t.Errorf("Seq = %d, want 0", info.Seq)
+	}
+
+	pconn, _ := sqlite.OpenConn(pullPath, sqlite.OpenReadOnly)
+	defer pconn.Close()
+	var count int64
+	sqlitex.Execute(pconn, `SELECT COUNT(*) FROM items`, &sqlitex.ExecOptions{
+		ResultFunc: func(s *sqlite.Stmt) error { count = s.ColumnInt64(0); return nil },
+	})
+	if count != 2 {
+		t.Errorf("item count = %d, want 2", count)
+	}
+}
+
+func TestInit_AlreadyExists(t *testing.T) {
+	store := NewMemBlobStore()
+	ctx := context.Background()
+
+	if err := Init(ctx, store, "mydb/", ""); err != nil {
+		t.Fatalf("first Init: %v", err)
+	}
+
+	// Second Init should fail.
+	err := Init(ctx, store, "mydb/", "")
+	if !errors.Is(err, ErrPreconditionFailed) {
+		t.Errorf("second Init: expected ErrPreconditionFailed, got %v", err)
+	}
+
+	// Also when initializing from a file.
+	srcPath := filepath.Join(t.TempDir(), "src.sqlite")
+	conn, _ := sqlite.OpenConn(srcPath, sqlite.OpenReadWrite|sqlite.OpenCreate)
+	sqlitex.Execute(conn, `PRAGMA user_version = 0`, nil)
+	conn.Close()
+
+	err = Init(ctx, store, "mydb/", srcPath)
+	if !errors.Is(err, ErrPreconditionFailed) {
+		t.Errorf("Init from file over existing: expected ErrPreconditionFailed, got %v", err)
+	}
+}
+
+func TestInit_ValidatesSQLite(t *testing.T) {
+	store := NewMemBlobStore()
+	ctx := context.Background()
+
+	bad := filepath.Join(t.TempDir(), "bad.sqlite")
+	os.WriteFile(bad, []byte("not a sqlite file"), 0644)
+
+	err := Init(ctx, store, "mydb/", bad)
+	if err == nil {
+		t.Fatal("Init with invalid SQLite file succeeded; expected error")
+	}
+
+	// Manifest should NOT have been created.
+	if _, _, err := loadManifest(ctx, store, "mydb/manifest.json"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("manifest exists after failed Init: %v", err)
+	}
+}
+
+func TestInit_PrefixValidation(t *testing.T) {
+	store := NewMemBlobStore()
+	err := Init(context.Background(), store, "noslash", "")
+	if err == nil {
+		t.Error("expected error for prefix without trailing slash")
+	}
+}
