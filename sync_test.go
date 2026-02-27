@@ -83,29 +83,19 @@ func queryString(t *testing.T, conn *sqlite.Conn, sql string) string {
 	return result
 }
 
-// captureChangeset runs fn inside a session on conn and returns the resulting
-// changeset bytes. This is a test-only miniature of what Stage 4 will build
-// properly.
+// captureChangeset is a test wrapper around the production capture function
+// with a simpler fn signature (no error return — test mustExec calls t.Fatal
+// on error, so this fn never fails).
 func captureChangeset(t *testing.T, conn *sqlite.Conn, fn func()) []byte {
 	t.Helper()
-	sess, err := conn.CreateSession("")
+	cs, err := capture(conn, func(*sqlite.Conn) error {
+		fn()
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
+		t.Fatalf("capture: %v", err)
 	}
-	defer sess.Delete()
-
-	// Attach all tables.
-	if err := sess.Attach(""); err != nil {
-		t.Fatalf("Attach: %v", err)
-	}
-
-	fn()
-
-	var buf bytes.Buffer
-	if err := sess.WriteChangeset(&buf); err != nil {
-		t.Fatalf("WriteChangeset: %v", err)
-	}
-	return buf.Bytes()
+	return cs
 }
 
 // snapshotBytes returns the full content of the SQLite file at path.
