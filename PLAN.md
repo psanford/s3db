@@ -8,12 +8,12 @@ Companion to [DESIGN.md](./DESIGN.md). This document covers **how to build it**:
 
 | Purpose | Choice | Rationale |
 |---|---|---|
-| SQLite binding | `zombiezen.com/go/sqlite` | First-class session/changeset API with Go-native conflict handler callbacks. CGo required. Not `database/sql` but that's fine — one connection, one file. |
+| SQLite binding | `zombiezen.com/go/sqlite` | First-class session/changeset API with Go-native conflict handler callbacks. **As of v1.x it's backed by `modernc.org/sqlite` — pure Go, no CGo.** Not `database/sql` but that's fine — one connection, one file. |
 | S3 client | `github.com/aws/aws-sdk-go-v2/service/s3` | Conditional write support (`IfMatch`, `IfNoneMatch`), context-aware, standard. |
 | Testing | stdlib `testing`, optionally `testify/require` for ergonomics | No heavy framework. |
 | Integration test backend | MinIO (Docker) or `s3mock` | Real conditional-write semantics; localstack also works. |
 
-**Build requirement:** CGo means Lambda artifacts must be built on Linux (or in a Linux container). Document this in the README — `GOOS=linux go build` alone won't cut it; need `CGO_ENABLED=1` and a Linux toolchain or Docker-based build.
+**Build requirement:** None special — the whole stack is pure Go. `GOOS=linux GOARCH=amd64 go build` produces a Lambda-ready binary with no cross-compilation headaches. This is a significant improvement over the original assumption.
 
 ---
 
