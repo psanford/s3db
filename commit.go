@@ -182,8 +182,11 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 		// we can't rebase in place — we need a full refresh, which means
 		// closing conn, which means losing the SAVEPOINT. Roll back and
 		// start over.
-		if m2.Snapshot.Seq > st.localSeq {
-			rollbackAndResync(ctx, cfg, st, localPath, m2, etag2, &release)
+		if m2.Snapshot.Seq > st.localSeq || m2.Snapshot.Key != st.snapshotKey {
+			if rerr := rollbackAndResync(ctx, cfg, st, localPath, m2, etag2, &release); rerr != nil {
+				err = rerr
+				return err
+			}
 			needCapture = true
 			continue
 		}
@@ -224,7 +227,10 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 
 		// Rebase conflicted. Roll back fn's changes (and the partial rebase),
 		// sync to the new manifest, and re-run fn from scratch next iteration.
-		rollbackAndResync(ctx, cfg, st, localPath, m2, etag2, &release)
+		if rerr := rollbackAndResync(ctx, cfg, st, localPath, m2, etag2, &release); rerr != nil {
+			err = rerr
+			return err
+		}
 		needCapture = true
 	}
 
@@ -238,19 +244,19 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 // changes and any partial rebase), updates st to the given manifest, and
 // syncs conn to match. *release is nilled so the deferred release in
 // doUpdate doesn't double-fire.
-func rollbackAndResync(ctx context.Context, cfg *commitConfig, st *commitState, localPath string, m *Manifest, etag string, release *func(*error)) {
+//
+// Returns an error if the post-rollback sync fails. The caller MUST abort
+// the commit in that case — st.manifest/etag have been updated but conn
+// has NOT been synced, so continuing would risk committing a changeset
+// whose before-image doesn't match the state at its predecessor seq.
+func rollbackAndResync(ctx context.Context, cfg *commitConfig, st *commitState, localPath string, m *Manifest, etag string, release *func(*error)) error {
 	rollbackErr := errors.New("rollback")
 	(*release)(&rollbackErr)
 	*release = nil
 
 	st.manifest = m
 	st.etag = etag
-	// syncToManifest is called unconditionally; if it fails, the next
-	// capture attempt will operate on stale data and likely fail too,
-	// but we don't have a good recovery here — surface on next iteration.
-	// In practice this is a store-unavailable error and the whole Update
-	// will fail.
-	_ = syncToManifest(ctx, cfg, st, localPath)
+	return syncToManifest(ctx, cfg, st, localPath)
 }
 
 // applyMissingEntry fetches and applies one log entry. Separated for error
