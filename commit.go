@@ -11,9 +11,7 @@ import (
 	"zombiezen.com/go/sqlite/sqlitex"
 )
 
-// commitState holds the mutable state tracked across commit attempts. The DB
-// struct (Stage 6) will embed this; for now it's passed explicitly to keep
-// the commit loop testable before DB exists.
+// commitState holds the mutable state tracked across commit attempts.
 type commitState struct {
 	conn        *sqlite.Conn // local SQLite connection
 	localSeq    int64        // seq that conn is currently at
@@ -54,7 +52,7 @@ func syncToManifest(ctx context.Context, cfg *commitConfig, st *commitState, loc
 		if err := downloadSnapshot(ctx, cfg.store, m.Snapshot.Key, m.Snapshot.Size, localPath); err != nil {
 			return err
 		}
-		conn, err := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
+		conn, err := openLocalConn(localPath)
 		if err != nil {
 			return fmt.Errorf("sync: reopen after refresh: %w", err)
 		}
@@ -63,11 +61,17 @@ func syncToManifest(ctx context.Context, cfg *commitConfig, st *commitState, loc
 		st.snapshotKey = m.Snapshot.Key
 	}
 
+	// applyLog returns the seq it successfully advanced to, even on error.
+	// Assign before the error check so localSeq always reflects conn's
+	// actual state. Otherwise a partial apply (e.g. corrupt changeset
+	// midway through) would leave conn ahead of localSeq, and the next
+	// sync would try to re-apply already-applied changesets — which
+	// conflicts on their own before-images and wedges the DB.
 	seq, err := applyLog(ctx, cfg.store, st.conn, m.Log, st.localSeq)
+	st.localSeq = seq
 	if err != nil {
 		return err
 	}
-	st.localSeq = seq
 	return nil
 }
 

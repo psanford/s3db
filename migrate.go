@@ -91,10 +91,16 @@ func (db *DB) runMigrations(ctx context.Context) error {
 // ErrPreconditionFailed if the CAS loses (caller should re-check and retry
 // or skip).
 func (db *DB) applyMigration(ctx context.Context, m *manifest, etag string, mig *Migration) error {
-	// Sync local DB to the manifest we're migrating from. This ensures
-	// Up runs against the exact state the manifest describes.
+	// Force a full refresh: discard whatever is in the local file and
+	// re-download the snapshot. This is essential for correctness on CAS
+	// retry — if a regular writer (not a concurrent migrator) committed
+	// between our syncToManifest and manifest CAS, the snapshot key is
+	// unchanged, so the incremental sync path would keep our dirty
+	// already-ran-Up local state and run Up AGAIN on top of it. Clearing
+	// snapshotKey forces the needRefresh branch in syncToManifest.
 	db.st.manifest = m
 	db.st.etag = etag
+	db.st.snapshotKey = "" // force full refresh
 	if err := syncToManifest(ctx, &db.cfg, &db.st, db.localPath); err != nil {
 		return err
 	}

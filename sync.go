@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sync/errgroup"
 	"zombiezen.com/go/sqlite"
@@ -40,7 +41,7 @@ const fetchConcurrency = 8
 // The caller is responsible for closing any SQLite connection on destPath
 // before calling this, and reopening after.
 func downloadSnapshot(ctx context.Context, store BlobStore, key string, size int64, destPath string) error {
-	tmp, err := os.CreateTemp("", "s3db-snap-*")
+	tmp, err := os.CreateTemp(filepath.Dir(destPath), "s3db-snap-*")
 	if err != nil {
 		return err
 	}
@@ -57,6 +58,10 @@ func downloadSnapshot(ctx context.Context, store BlobStore, key string, size int
 		return fmt.Errorf("download snapshot %s: %w", key, err)
 	}
 
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}

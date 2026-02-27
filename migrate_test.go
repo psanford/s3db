@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -363,14 +365,10 @@ func TestMigrate_UpdateRequiresMatchingSchema(t *testing.T) {
 	}
 	db1.Close()
 
-	// A client without migrations (schemaVer=0) should be rejected.
+	// A client without migrations (schemaVer=0) should be rejected —
+	// runMigrations is always called, sees maxVer=0 < manifest.SchemaVersion=3,
+	// and returns ErrSchemaTooNew.
 	db2, _ := Open(ctx, store, "mydb/")
-	// Open succeeds (no migrations to check), but...
-	// Actually Open should fail because runMigrations checks schema_version
-	// against maxVer=0 and the DB is at 3 → ErrSchemaTooNew.
-	// Wait, let me check the logic... runMigrations is always called, and
-	// with no migrations maxVer=0, manifest.SchemaVersion=3 > 0 → error.
-	// So db2 should be nil.
 	if db2 != nil {
 		db2.Close()
 		t.Error("Open without migrations succeeded against v3 DB; expected ErrSchemaTooNew")
@@ -416,5 +414,136 @@ func TestMigrate_GapInVersions(t *testing.T) {
 		if !exists {
 			t.Errorf("table %s not created", tbl)
 		}
+	}
+}
+
+// migrateInterferingStore forces a concurrent write to land between a
+// migrator's syncToManifest and its manifest CAS. It does this by hooking
+// the snapshot upload (which happens after sync, before CAS) and committing
+// a regular write via a separate DB instance at that moment.
+//
+// This reproduces the rolling-deploy scenario: old clients at schema N keep
+// writing while a new client tries to migrate to N+1.
+type migrateInterferingStore struct {
+	*MemBlobStore
+	writer    *DB // a DB instance at the OLD schema, used to interfere
+	interfere atomic.Bool
+	fired     atomic.Int32
+}
+
+func (s *migrateInterferingStore) Put(ctx context.Context, key string, body io.Reader, cond PutCondition) (string, error) {
+	// Snapshot uploads from migrations have "snap-mig-" in the key.
+	// Interfere exactly once per test, to force exactly one CAS retry.
+	if s.interfere.Load() && strings.Contains(key, "snapshots/snap-mig-") {
+		if s.interfere.CompareAndSwap(true, false) {
+			s.fired.Add(1)
+			// Do a regular write. This advances seq but does NOT change
+			// the snapshot key — the exact case that triggers the bug.
+			s.writer.Update(ctx, func(c *sqlite.Conn) error {
+				return sqlitex.Execute(c, `UPDATE counter SET n = n + 1 WHERE id = 1`, nil)
+			})
+		}
+	}
+	return s.MemBlobStore.Put(ctx, key, body, cond)
+}
+
+func TestMigrate_ConcurrentWriter(t *testing.T) {
+	// Regression test for the migration-dirty-state bug: if a regular
+	// writer commits between the migrator's syncToManifest and manifest
+	// CAS, the migration retry must NOT run Up() again on an already-
+	// migrated local DB.
+	//
+	// Before the fix, this would fail with "table already exists" on the
+	// second Up() attempt, because the incremental sync path kept the
+	// dirty local state.
+	ctx := context.Background()
+	inner := NewMemBlobStore()
+
+	// Bring the DB to schema v1 with a counter table. This is the "old"
+	// schema that writers at the old version will target.
+	v1Migs := []Migration{
+		{Version: 1, Name: "init", Up: func(c *sqlite.Conn) error {
+			return sqlitex.ExecuteScript(c, `
+				CREATE TABLE counter (id INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+				INSERT INTO counter (id, n) VALUES (1, 0);
+			`, nil)
+		}},
+	}
+	setupDB, err := Open(ctx, inner, "mydb/", WithMigrations(v1Migs))
+	if err != nil {
+		t.Fatalf("setup Open: %v", err)
+	}
+	setupDB.Close()
+
+	// Open a writer at v1 (the "old" client).
+	writer, err := Open(ctx, inner, "mydb/", WithMigrations(v1Migs))
+	if err != nil {
+		t.Fatalf("writer Open: %v", err)
+	}
+	defer writer.Close()
+
+	// Wrap the store to interfere during migration.
+	store := &migrateInterferingStore{MemBlobStore: inner, writer: writer}
+	store.interfere.Store(true)
+
+	// Migrate to v2. The interfering store will cause one CAS retry.
+	// The v2 migration uses plain CREATE TABLE (not IF NOT EXISTS) so
+	// running Up twice would fail loudly.
+	var upCount atomic.Int32
+	v2Migs := append(v1Migs, Migration{
+		Version: 2, Name: "add_log", Up: func(c *sqlite.Conn) error {
+			upCount.Add(1)
+			return sqlitex.ExecuteScript(c, `
+				CREATE TABLE event_log (id INTEGER PRIMARY KEY, msg TEXT);
+				INSERT INTO event_log (id, msg) VALUES (1, 'migrated');
+			`, nil)
+		},
+	})
+
+	migrator, err := Open(ctx, store, "mydb/", WithMigrations(v2Migs))
+	if err != nil {
+		t.Fatalf("migrator Open: %v", err)
+	}
+	defer migrator.Close()
+
+	// Verify the interference actually fired (otherwise the test didn't
+	// exercise the retry path).
+	if store.fired.Load() != 1 {
+		t.Fatalf("interference didn't fire (fired=%d); test harness broken", store.fired.Load())
+	}
+
+	// Up should have run exactly twice (once before CAS fail, once after
+	// the forced refresh). What matters is that the SECOND run was on a
+	// fresh snapshot, not on the dirty already-migrated state.
+	if n := upCount.Load(); n != 2 {
+		t.Logf("up ran %d times (expected 2: once per CAS attempt)", n)
+	}
+
+	// Verify final state: schema v2, exactly one event_log row.
+	m, _, _ := loadManifest(ctx, inner, "mydb/manifest.json")
+	if m.SchemaVersion != 2 {
+		t.Errorf("SchemaVersion = %d, want 2", m.SchemaVersion)
+	}
+
+	var logCount int64
+	migrator.View(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT COUNT(*) FROM event_log`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { logCount = s.ColumnInt64(0); return nil },
+		})
+	})
+	if logCount != 1 {
+		t.Errorf("event_log rows = %d, want 1 (backfill must not double-insert)", logCount)
+	}
+
+	// The concurrent write's increment should be preserved in the
+	// migrated snapshot (migration re-syncs before re-running Up).
+	var n int64
+	migrator.View(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT n FROM counter WHERE id = 1`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { n = s.ColumnInt64(0); return nil },
+		})
+	})
+	if n != 1 {
+		t.Errorf("counter = %d, want 1 (concurrent write must survive migration)", n)
 	}
 }
