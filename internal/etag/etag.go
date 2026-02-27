@@ -17,13 +17,12 @@ func Normalize(s string) string {
 	return strings.Trim(s, `"`)
 }
 
-// Compute returns the ETag for a body the way S3 does for single-part
-// uploads: hex-encoded MD5.
-//
-// Note: S3 multipart uploads use a different scheme (MD5-of-MD5s with a part
-// count suffix). This library never does multipart uploads, so simple MD5 is
-// correct and sufficient for both the in-memory fake and for predicting what
-// S3 will return.
+// Compute returns a hex-encoded MD5 of body. This is the ETag that S3
+// returns for single-part, unencrypted uploads — but NOT for multipart
+// uploads (MD5-of-MD5s with part-count suffix) or server-side encrypted
+// objects (opaque). In this library it is only used by MemBlobStore to
+// generate deterministic ETags for testing; production code never
+// predicts S3's ETag, it just echoes what S3 returns.
 func Compute(body []byte) string {
 	sum := md5.Sum(body)
 	return hex.EncodeToString(sum[:])

@@ -9,6 +9,14 @@ import (
 	"strings"
 )
 
+// manifestFormatVersion tracks the JSON encoding schema of the manifest.
+// Bump this when making a BREAKING change to the manifest wire format
+// (field removal, type change, semantic change). Additive changes (new
+// optional fields) don't need a bump — json.Unmarshal tolerates unknown
+// fields. Old clients encountering a higher format_version will refuse to
+// proceed rather than misinterpret the manifest.
+const manifestFormatVersion = 1
+
 // manifest is the single source of truth for the database state. It points
 // to an immutable snapshot and an ordered log of changesets to apply on top.
 // The manifest is the only object written with contention; everything it
@@ -19,6 +27,11 @@ import (
 //   - Log entries have strictly increasing Seq, starting at Snapshot.Seq+1
 //   - Seq equals Snapshot.Seq if Log is empty, else the last Log entry's Seq
 type manifest struct {
+	// FormatVersion identifies the manifest encoding. Clients refuse to
+	// operate on manifests with a higher version than they understand.
+	// 0 is treated as 1 (backward compat with pre-versioned manifests).
+	FormatVersion int `json:"format_version,omitempty"`
+
 	// Seq is the logical version of the database. It increases by exactly 1
 	// with each committed write. It never has gaps and never goes backward.
 	Seq int64 `json:"seq"`
@@ -74,6 +87,10 @@ func (m *manifest) validate() error {
 	if m.Snapshot.Seq < 0 {
 		return fmt.Errorf("manifest: snapshot seq %d is negative", m.Snapshot.Seq)
 	}
+	if m.FormatVersion > manifestFormatVersion {
+		return fmt.Errorf("manifest: format_version %d is newer than this client supports (%d); upgrade",
+			m.FormatVersion, manifestFormatVersion)
+	}
 	if m.SchemaVersion < 0 {
 		return fmt.Errorf("manifest: schema_version %d is negative", m.SchemaVersion)
 	}
@@ -118,6 +135,7 @@ func (m *manifest) appendLog(entry logEntry) *manifest {
 // The receiver is not modified.
 func (m *manifest) withSnapshot(snapshot blobRef) *manifest {
 	return &manifest{
+		FormatVersion: manifestFormatVersion,
 		Seq:           snapshot.Seq,
 		SchemaVersion: m.SchemaVersion,
 		Snapshot:      snapshot,
@@ -147,6 +165,7 @@ func loadManifest(ctx context.Context, store BlobStore, key string) (*manifest, 
 // new ETag on success. cond is typically either IfMatch (CAS during commit)
 // or IfNoneMatch (bootstrap).
 func putManifest(ctx context.Context, store BlobStore, key string, m *manifest, cond PutCondition) (string, error) {
+	m.FormatVersion = manifestFormatVersion
 	if err := m.validate(); err != nil {
 		return "", err
 	}

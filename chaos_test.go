@@ -311,3 +311,133 @@ func (s *crashingStore) Put(ctx context.Context, key string, body io.Reader, con
 	}
 	return s.MemBlobStore.Put(ctx, key, body, cond)
 }
+
+// phantomStore simulates the most dangerous failure mode: the manifest PUT
+// succeeds on the server, but the client receives an error (lost response,
+// connection reset after 200 OK, etc.). From the client's perspective the
+// write failed, but the manifest HAS changed. The next operation will see
+// a 412 (etag mismatch) and must handle it correctly — the committed
+// changeset is real and must be preserved.
+type phantomStore struct {
+	*MemBlobStore
+	manifestKey string
+	failRate    float64
+	rng         *rand.Rand
+	mu          sync.Mutex
+}
+
+func (s *phantomStore) Put(ctx context.Context, key string, body io.Reader, cond PutCondition) (string, error) {
+	etag, err := s.MemBlobStore.Put(ctx, key, body, cond)
+	if err != nil {
+		return "", err
+	}
+	if key == s.manifestKey {
+		s.mu.Lock()
+		fail := s.rng.Float64() < s.failRate
+		s.mu.Unlock()
+		if fail {
+			// PUT succeeded but we tell the client it failed.
+			return "", fmt.Errorf("simulated lost response (PUT succeeded on server)")
+		}
+	}
+	return etag, nil
+}
+
+func TestChaos_PhantomManifestCommits(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping chaos test in short mode")
+	}
+
+	// This tests the scenario ISSUES.md calls the most dangerous: manifest
+	// PUT succeeds server-side but the client sees a network error. The
+	// client thinks the write failed, but it actually committed. The
+	// library must not corrupt state in this case.
+	//
+	// Expected behaviour: the client sees an error and doesn't count the
+	// write. But the write IS in the log. So the counter will be >= the
+	// number of client-observed successes. What must NEVER happen:
+	// counter != (client successes + phantom commits), or replay failure.
+	ctx := context.Background()
+	inner := NewMemBlobStore()
+	seedSchema(t, inner, "mydb/")
+	seedDB, _ := Open(ctx, inner, "mydb/")
+	seedDB.Update(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO users (id, name, balance) VALUES (1, 'c', 0)`, nil)
+	})
+	seedDB.Close()
+
+	phantom := &phantomStore{
+		MemBlobStore: inner,
+		manifestKey:  "mydb/manifest.json",
+		failRate:     0.3,
+		rng:          rand.New(rand.NewSource(13)),
+	}
+
+	var clientSuccesses int64
+	var mu sync.Mutex
+
+	const workers = 4
+	const attemptsPerWorker = 10
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < attemptsPerWorker; j++ {
+				if err := attemptIncrement(ctx, phantom, "mydb/"); err != nil {
+					continue
+				}
+				mu.Lock()
+				clientSuccesses++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Verify via clean store.
+	verifier, err := Open(ctx, inner, "mydb/")
+	if err != nil {
+		t.Fatalf("Open verifier: %v", err)
+	}
+	defer verifier.Close()
+
+	var counter int64
+	verifier.View(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT balance FROM users WHERE id = 1`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { counter = s.ColumnInt64(0); return nil },
+		})
+	})
+
+	t.Logf("client successes = %d, counter = %d (phantoms = %d)",
+		clientSuccesses, counter, counter-clientSuccesses)
+
+	// Counter must be AT LEAST the client's observed successes (phantom
+	// commits add more). It must never be LESS — that would mean a
+	// client-successful write was lost.
+	if counter < clientSuccesses {
+		t.Errorf("counter %d < client successes %d — committed writes lost",
+			counter, clientSuccesses)
+	}
+
+	// Log must replay cleanly.
+	m, _, _ := loadManifest(ctx, inner, "mydb/manifest.json")
+	replayPath := t.TempDir() + "/replay.sqlite"
+	if err := downloadSnapshot(ctx, inner, m.Snapshot.Key, 0, replayPath); err != nil {
+		t.Fatalf("replay download: %v", err)
+	}
+	conn, _ := sqlite.OpenConn(replayPath, sqlite.OpenReadWrite)
+	defer conn.Close()
+	if _, err := applyLog(ctx, inner, conn, m.Log, m.Snapshot.Seq); err != nil {
+		t.Fatalf("replay failed — log is inconsistent: %v", err)
+	}
+
+	var replayCounter int64
+	sqlitex.Execute(conn, `SELECT balance FROM users WHERE id = 1`, &sqlitex.ExecOptions{
+		ResultFunc: func(s *sqlite.Stmt) error { replayCounter = s.ColumnInt64(0); return nil },
+	})
+	if replayCounter != counter {
+		t.Errorf("replay counter = %d, live counter = %d — divergence", replayCounter, counter)
+	}
+}

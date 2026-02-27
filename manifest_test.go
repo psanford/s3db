@@ -363,3 +363,50 @@ func TestPutManifest_IfNoneMatch(t *testing.T) {
 		t.Errorf("expected ErrPreconditionFailed on second IfNoneMatch, got %v", err)
 	}
 }
+
+func TestManifest_FormatVersion_Rejected(t *testing.T) {
+	// A manifest with a format_version newer than we understand should
+	// fail validation rather than being silently misinterpreted.
+	m := validManifest()
+	m.FormatVersion = manifestFormatVersion + 1
+	if err := m.validate(); err == nil {
+		t.Error("expected error for newer format_version, got nil")
+	}
+}
+
+func TestManifest_FormatVersion_ZeroOK(t *testing.T) {
+	// format_version=0 (absent in old JSON) is treated as compatible.
+	m := validManifest()
+	m.FormatVersion = 0
+	if err := m.validate(); err != nil {
+		t.Errorf("format_version=0 should validate (backcompat): %v", err)
+	}
+}
+
+func TestPutManifest_StampsFormatVersion(t *testing.T) {
+	// putManifest should stamp the current format version regardless of
+	// what the caller passed in.
+	s := NewMemBlobStore()
+	ctx := context.Background()
+
+	m := validManifest()
+	m.FormatVersion = 0 // not set by caller
+	if _, err := putManifest(ctx, s, "m", m, NoCondition); err != nil {
+		t.Fatalf("putManifest: %v", err)
+	}
+
+	loaded, _, _ := loadManifest(ctx, s, "m")
+	if loaded.FormatVersion != manifestFormatVersion {
+		t.Errorf("FormatVersion = %d, want %d (stamped by putManifest)",
+			loaded.FormatVersion, manifestFormatVersion)
+	}
+}
+
+func TestPutCondition_BothSetRejected(t *testing.T) {
+	s := NewMemBlobStore()
+	_, err := s.Put(context.Background(), "k", strings.NewReader("x"),
+		PutCondition{IfMatch: "abc", IfNoneMatch: true})
+	if !errors.Is(err, errBothConditions) {
+		t.Errorf("expected errBothConditions, got %v", err)
+	}
+}

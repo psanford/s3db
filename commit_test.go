@@ -370,6 +370,12 @@ func TestDoUpdate_CleanRebase(t *testing.T) {
 
 	// Verify replay from scratch also produces correct state.
 	verifyReplay(t, e, map[int]string{1: "alice", 2: "bob"})
+
+	// Strongest check: after a clean rebase, the local conn state must
+	// match a fresh replay row-for-row. This catches any divergence in
+	// the rebase ordering invariant (local = base+fn+theirs must equal
+	// replay = base+theirs+fn).
+	verifyLocalMatchesReplay(t, e)
 }
 
 // --- Contention: conflicting rebase (same row) -----------------------------
@@ -411,6 +417,7 @@ func TestDoUpdate_ConflictRebase(t *testing.T) {
 
 	// Replay should also show 999.
 	verifyReplay(t, e, map[int]string{1: "alice"})
+	verifyLocalMatchesReplay(t, e)
 }
 
 // --- Retry exhaustion ------------------------------------------------------
@@ -501,6 +508,71 @@ func verifyReplay(t *testing.T, e *testEnv, wantUsers map[int]string) {
 			t.Errorf("replay user %d = %q, want %q", id, got, name)
 		}
 	}
+}
+
+// verifyLocalMatchesReplay checks the critical rebase invariant: the live
+// conn (which may have had a clean rebase applied, producing state in the
+// order base + fn + theirs) must be row-identical to a fresh replay
+// (which produces base + theirs + fn). These are only equivalent when the
+// row sets are truly disjoint — which the rebase conflict detection is
+// supposed to guarantee. This test catches any future divergence in the
+// conflict semantics.
+func verifyLocalMatchesReplay(t *testing.T, e *testEnv) {
+	t.Helper()
+	ctx := context.Background()
+
+	m := e.loadManifest(t)
+	replayPath := filepath.Join(t.TempDir(), "replay.sqlite")
+	if err := downloadSnapshot(ctx, e.store, m.Snapshot.Key, 0, replayPath); err != nil {
+		t.Fatalf("diff-replay: downloadSnapshot: %v", err)
+	}
+	rconn, err := sqlite.OpenConn(replayPath, sqlite.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("diff-replay: OpenConn: %v", err)
+	}
+	defer rconn.Close()
+	if _, err := applyLog(ctx, e.store, rconn, m.Log, m.Snapshot.Seq); err != nil {
+		t.Fatalf("diff-replay: applyLog: %v", err)
+	}
+
+	// Full-row diff of the users table, ordered by PK.
+	local := dumpUsers(t, e.st.conn)
+	replay := dumpUsers(t, rconn)
+
+	if len(local) != len(replay) {
+		t.Fatalf("row count diverged: local=%d replay=%d\n  local:  %v\n  replay: %v",
+			len(local), len(replay), local, replay)
+	}
+	for i := range local {
+		if local[i] != replay[i] {
+			t.Errorf("row %d diverged:\n  local:  %+v\n  replay: %+v", i, local[i], replay[i])
+		}
+	}
+}
+
+type userRow struct {
+	ID      int64
+	Name    string
+	Balance int64
+}
+
+func dumpUsers(t *testing.T, conn *sqlite.Conn) []userRow {
+	t.Helper()
+	var rows []userRow
+	err := sqlitex.Execute(conn, `SELECT id, name, balance FROM users ORDER BY id`, &sqlitex.ExecOptions{
+		ResultFunc: func(s *sqlite.Stmt) error {
+			rows = append(rows, userRow{
+				ID:      s.ColumnInt64(0),
+				Name:    s.ColumnText(1),
+				Balance: s.ColumnInt64(2),
+			})
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("dumpUsers: %v", err)
+	}
+	return rows
 }
 
 // --- Concurrent real contention (not simulated) ----------------------------

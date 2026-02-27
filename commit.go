@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"time"
 
 	"github.com/google/uuid"
 	"zombiezen.com/go/sqlite"
@@ -118,6 +120,7 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 		cs          []byte
 		csKey       string
 		release     func(*error)
+		orphan      string // previous blob orphaned by needCapture retry
 	)
 
 	// If we return early while a SAVEPOINT is open, roll it back. This
@@ -130,6 +133,21 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 	}()
 
 	for attempt := 0; attempt < cfg.maxRetries; attempt++ {
+		if attempt > 0 {
+			// Jittered exponential backoff on CAS retry. Without this,
+			// concurrent writers that all get 412 retry in lockstep —
+			// thundering herd where one wins and N-1 lose every round.
+			// Cap the base delay so we don't blow past ctx deadlines.
+			base := time.Duration(1<<min(attempt-1, 6)) * 10 * time.Millisecond // 10,20,40,...640ms cap
+			jitter := time.Duration(rand.Int63n(int64(base)))
+			select {
+			case <-time.After(base/2 + jitter):
+			case <-ctx.Done():
+				err = ctx.Err()
+				return err
+			}
+		}
+
 		// Phase 1: capture if needed.
 		if needCapture {
 			release = sqlitex.Save(st.conn)
@@ -142,6 +160,15 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 			if cs == nil {
 				// fn made no recordable changes. Nothing to commit.
 				return nil // SAVEPOINT releases cleanly (err is nil)
+			}
+
+			// Best-effort cleanup of the previous orphan. The old blob
+			// was uploaded but never committed (rebase conflict forced
+			// recapture). Deleting it now prevents orphan accumulation
+			// under contention; if the delete fails, GC will catch it.
+			if orphan != "" {
+				_ = cfg.store.Delete(ctx, orphan)
+				orphan = ""
 			}
 
 			epoch := st.manifest.epoch()
@@ -191,6 +218,7 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 				err = rerr
 				return err
 			}
+			orphan = csKey // will be deleted on next capture
 			needCapture = true
 			continue
 		}
@@ -235,6 +263,7 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 			err = rerr
 			return err
 		}
+		orphan = csKey // will be deleted on next capture
 		needCapture = true
 	}
 
