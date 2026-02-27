@@ -1,0 +1,316 @@
+package s3db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+
+	"zombiezen.com/go/sqlite"
+)
+
+// DB is a concurrency-safe SQLite database backed by a BlobStore. It holds
+// a single long-lived local SQLite connection synced to the remote state.
+//
+// DB is safe for concurrent use — View and Update are serialized by an
+// internal mutex. This is appropriate for Lambda (typically one goroutine
+// per invocation) and prevents pointless intra-process CAS contention.
+//
+// Create a DB with Open. Close it when done to release the local file and
+// connection.
+type DB struct {
+	mu sync.Mutex
+
+	cfg       commitConfig
+	st        commitState
+	localPath string
+	opts      options
+
+	// ownLocalFile is true if we created a temp file and should delete it
+	// on Close. False if the user specified a path (their responsibility).
+	ownLocalFile bool
+}
+
+// Migration is a schema-evolution step. See WithMigrations and DESIGN.md.
+type Migration struct {
+	Version int
+	Name    string
+	Up      func(*sqlite.Conn) error
+}
+
+// Open connects to (or initializes) a database under the given prefix in
+// the store. The prefix should end with "/" — e.g. "mydb/".
+//
+// If no manifest exists at prefix, Open creates one with an empty SQLite
+// database as the initial snapshot (schema_version=0, seq=0). This is safe
+// under concurrent Opens: the creation uses If-None-Match, and the loser
+// of that race falls back to reading the winner's manifest.
+//
+// If WithMigrations is set, pending migrations are applied before Open
+// returns. See DESIGN.md for the migration-as-forced-compaction model.
+//
+// The returned DB holds a local SQLite file. If WithLocalPath is not set,
+// a temp file is used and deleted on Close. For Lambda, set WithLocalPath
+// to something under /tmp so the file persists across warm starts.
+func Open(ctx context.Context, store BlobStore, prefix string, opts ...Option) (*DB, error) {
+	if !strings.HasSuffix(prefix, "/") {
+		return nil, fmt.Errorf("s3db: prefix must end with /, got %q", prefix)
+	}
+
+	o := defaultOptions()
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	manifestKey := prefix + "manifest.json"
+
+	// Load or bootstrap the manifest.
+	m, etag, err := loadManifest(ctx, store, manifestKey)
+	if errors.Is(err, ErrNotFound) {
+		m, etag, err = bootstrap(ctx, store, prefix, manifestKey)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Set up local file.
+	localPath := o.localPath
+	ownLocalFile := false
+	if localPath == "" {
+		tmp, err := os.CreateTemp("", "s3db-*.sqlite")
+		if err != nil {
+			return nil, err
+		}
+		localPath = tmp.Name()
+		tmp.Close()
+		ownLocalFile = true
+	}
+
+	// Download snapshot and open connection.
+	if err := downloadSnapshot(ctx, store, m.Snapshot.Key, localPath); err != nil {
+		if ownLocalFile {
+			os.Remove(localPath)
+		}
+		return nil, err
+	}
+	conn, err := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
+	if err != nil {
+		if ownLocalFile {
+			os.Remove(localPath)
+		}
+		return nil, fmt.Errorf("s3db: open local db: %w", err)
+	}
+
+	// Apply log to reach current state.
+	localSeq, err := applyLog(ctx, store, conn, m.Log, m.Snapshot.Seq)
+	if err != nil {
+		conn.Close()
+		if ownLocalFile {
+			os.Remove(localPath)
+		}
+		return nil, err
+	}
+
+	// Determine expected schema version from migrations.
+	schemaVer := 0
+	for _, mig := range o.migrations {
+		if mig.Version > schemaVer {
+			schemaVer = mig.Version
+		}
+	}
+
+	db := &DB{
+		cfg: commitConfig{
+			store:       store,
+			prefix:      prefix,
+			manifestKey: manifestKey,
+			maxRetries:  o.maxRetries,
+			schemaVer:   schemaVer,
+		},
+		st: commitState{
+			conn:     conn,
+			localSeq: localSeq,
+			manifest: m,
+			etag:     etag,
+		},
+		localPath:    localPath,
+		opts:         o,
+		ownLocalFile: ownLocalFile,
+	}
+
+	// Run pending migrations. This is stubbed for now (Stage 8); the
+	// options are wired but the runner is a no-op until migrate.go exists.
+	// Schema-version checking in Update still works — if migrations are
+	// registered but not yet applied, Update will fail with
+	// ErrSchemaMismatch, which is the correct behavior.
+	if len(o.migrations) > 0 {
+		if err := db.migrate(ctx); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+
+	return db, nil
+}
+
+// bootstrap creates an initial empty database and manifest. Safe under
+// concurrent callers via If-None-Match on the manifest — exactly one
+// bootstrap succeeds; others fall back to loading the winner's manifest.
+func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string) (*Manifest, string, error) {
+	// Build an empty SQLite file in a temp location.
+	tmp, err := os.CreateTemp("", "s3db-bootstrap-*.sqlite")
+	if err != nil {
+		return nil, "", err
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	// OpenConn with OpenCreate writes the SQLite header.
+	conn, err := sqlite.OpenConn(tmpPath, sqlite.OpenReadWrite|sqlite.OpenCreate)
+	if err != nil {
+		return nil, "", fmt.Errorf("bootstrap: create empty db: %w", err)
+	}
+	conn.Close()
+
+	// Upload the empty snapshot. This key is deterministic (no UUID) so
+	// concurrent bootstraps write the same content to the same key — the
+	// second PUT is a harmless overwrite of identical bytes.
+	snapKey := prefix + "snapshots/snap-init.sqlite"
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		return nil, "", err
+	}
+	_, err = store.Put(ctx, snapKey, f, NoCondition)
+	f.Close()
+	if err != nil {
+		return nil, "", fmt.Errorf("bootstrap: upload snapshot: %w", err)
+	}
+
+	// CAS the manifest with If-None-Match.
+	m := &Manifest{
+		Seq:           0,
+		SchemaVersion: 0,
+		Snapshot:      BlobRef{Key: snapKey, Seq: 0},
+		Log:           nil,
+	}
+	etag, err := putManifest(ctx, store, manifestKey, m, PutCondition{IfNoneMatch: true})
+	if errors.Is(err, ErrPreconditionFailed) {
+		// Someone else won the bootstrap race. Load their manifest.
+		return loadManifest(ctx, store, manifestKey)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("bootstrap: put manifest: %w", err)
+	}
+	return m, etag, nil
+}
+
+// View runs fn against the current database state. It first syncs the local
+// DB to the latest manifest, then invokes fn. fn should only perform reads;
+// any writes it makes are local-only and will NOT be committed or rolled
+// back (they'll be visible to subsequent View/Update calls on the same DB
+// instance until the next sync). Don't write in View.
+//
+// View holds the DB mutex for its entire duration, serializing with other
+// View and Update calls on the same DB instance.
+func (db *DB) View(ctx context.Context, fn func(*sqlite.Conn) error) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if err := refreshManifest(ctx, &db.cfg, &db.st, db.localPath); err != nil {
+		return err
+	}
+	return fn(db.st.conn)
+}
+
+// Update runs fn as a transaction against the current database state, then
+// commits the resulting changeset via the CAS loop.
+//
+// fn may be invoked multiple times if concurrent writers cause rebase
+// conflicts. fn must therefore be idempotent with respect to side effects
+// OUTSIDE the database — don't send emails or make external API calls
+// inside fn. This is the same contract as a retry loop around a serializable
+// transaction.
+//
+// If fn performs only reads (no INSERTs/UPDATEs/DELETEs, or ones that change
+// nothing), Update returns nil without touching the store.
+//
+// Returns ErrConflict if CAS retries are exhausted, ErrSchemaMismatch or
+// ErrSchemaTooNew if the manifest's schema version doesn't match this
+// client's migrations, or fn's error if fn fails.
+func (db *DB) Update(ctx context.Context, fn func(*sqlite.Conn) error) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if err := refreshManifest(ctx, &db.cfg, &db.st, db.localPath); err != nil {
+		return err
+	}
+
+	if err := doUpdate(ctx, &db.cfg, &db.st, db.localPath, fn); err != nil {
+		return err
+	}
+
+	// Auto-compact hook. Runs synchronously in the lock for now — it's
+	// simple and correct. Stage 7 can make this async if the latency
+	// matters. Compaction errors are swallowed: the Update succeeded,
+	// and compaction can be retried later.
+	if db.opts.autoCompactAfter > 0 && len(db.st.manifest.Log) >= db.opts.autoCompactAfter {
+		_ = db.compact(ctx) // Stage 7
+	}
+
+	return nil
+}
+
+// Close releases the local SQLite connection and, if the local file was
+// created by Open (no WithLocalPath), deletes it. The DB is unusable after
+// Close.
+func (db *DB) Close() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	var err error
+	if db.st.conn != nil {
+		err = db.st.conn.Close()
+		db.st.conn = nil
+	}
+	if db.ownLocalFile && db.localPath != "" {
+		os.Remove(db.localPath)
+	}
+	return err
+}
+
+// Seq returns the sequence number the local DB is currently synced to.
+// Useful for diagnostics.
+func (db *DB) Seq() int64 {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.st.localSeq
+}
+
+// --- Stubs for stages 7/8 --------------------------------------------------
+// These let s3db.go compile without the full compact/migrate implementations.
+// They'll be replaced in the respective stages.
+
+// compact is a placeholder for Stage 7.
+func (db *DB) compact(ctx context.Context) error {
+	_ = ctx
+	return nil // no-op until Stage 7
+}
+
+// migrate is a placeholder for Stage 8. For now it just validates that
+// migrations have increasing version numbers — the schema-version guard
+// in refreshManifest/Update still works correctly.
+func (db *DB) migrate(ctx context.Context) error {
+	_ = ctx
+	last := 0
+	for _, m := range db.opts.migrations {
+		if m.Version <= last {
+			return fmt.Errorf("s3db: migrations must have strictly increasing versions, got %d after %d", m.Version, last)
+		}
+		last = m.Version
+	}
+	// TODO Stage 8: actually run pending migrations
+	return nil
+}
