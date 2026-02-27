@@ -49,6 +49,13 @@ func (f *faultyStore) Get(ctx context.Context, key string) (io.ReadCloser, strin
 	return f.inner.Get(ctx, key)
 }
 
+func (f *faultyStore) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error) {
+	if err := f.maybeFail(); err != nil {
+		return nil, err
+	}
+	return f.inner.GetRange(ctx, key, start, end)
+}
+
 func (f *faultyStore) Head(ctx context.Context, key string) (string, error) {
 	if err := f.maybeFail(); err != nil {
 		return "", err
@@ -170,7 +177,7 @@ func TestChaos_NoCorruption(t *testing.T) {
 	// match its predecessor's state" bugs.
 	m, _, _ := loadManifest(ctx, inner, "mydb/manifest.json")
 	replayPath := t.TempDir() + "/replay.sqlite"
-	if err := downloadSnapshot(ctx, inner, m.Snapshot.Key, replayPath); err != nil {
+	if err := downloadSnapshot(ctx, inner, m.Snapshot.Key, 0, replayPath); err != nil {
 		t.Fatalf("replay download: %v", err)
 	}
 	conn, _ := sqlite.OpenConn(replayPath, sqlite.OpenReadWrite)

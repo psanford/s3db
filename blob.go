@@ -23,6 +23,14 @@ type BlobStore interface {
 	// not exist.
 	Get(ctx context.Context, key string) (body io.ReadCloser, etag string, err error)
 
+	// GetRange retrieves bytes [start, end] inclusive of the object at key.
+	// The caller is responsible for closing the returned reader. Used for
+	// parallel snapshot downloads. Stores that don't support range requests
+	// may return the full object (the caller reads what it needs and
+	// discards the rest, which is wasteful but correct). Returns ErrNotFound
+	// if the key does not exist.
+	GetRange(ctx context.Context, key string, start, end int64) (body io.ReadCloser, err error)
+
 	// Head returns the ETag of the object at key without fetching the body.
 	// Returns ErrNotFound if the key does not exist.
 	Head(ctx context.Context, key string) (etag string, err error)

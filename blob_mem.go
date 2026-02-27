@@ -50,6 +50,29 @@ func (m *MemBlobStore) Get(ctx context.Context, key string) (io.ReadCloser, stri
 	return io.NopCloser(bytes.NewReader(e.body)), e.etag, nil
 }
 
+func (m *MemBlobStore) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	e, ok := m.objects[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	// Clamp to actual size, mirroring S3's behavior for ranges that
+	// extend past EOF.
+	n := int64(len(e.body))
+	if start >= n {
+		return io.NopCloser(bytes.NewReader(nil)), nil
+	}
+	if end >= n {
+		end = n - 1
+	}
+	return io.NopCloser(bytes.NewReader(e.body[start : end+1])), nil
+}
+
 func (m *MemBlobStore) Head(ctx context.Context, key string) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err

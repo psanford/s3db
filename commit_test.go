@@ -56,7 +56,7 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	// Set up local DB.
 	localPath := filepath.Join(dir, "local.sqlite")
-	if err := downloadSnapshot(ctx, store, snapKey, localPath); err != nil {
+	if err := downloadSnapshot(ctx, store, snapKey, 0, localPath); err != nil {
 		t.Fatalf("downloadSnapshot: %v", err)
 	}
 	conn, err := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
@@ -300,7 +300,7 @@ func concurrentWrite(t *testing.T, e *testEnv, fn func(*sqlite.Conn)) {
 
 	// Build DB at current state.
 	localPath := filepath.Join(dir, "concurrent.sqlite")
-	if err := downloadSnapshot(ctx, e.store, m.Snapshot.Key, localPath); err != nil {
+	if err := downloadSnapshot(ctx, e.store, m.Snapshot.Key, 0, localPath); err != nil {
 		t.Fatalf("concurrent: downloadSnapshot: %v", err)
 	}
 	conn, err := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
@@ -480,7 +480,7 @@ func verifyReplay(t *testing.T, e *testEnv, wantUsers map[int]string) {
 
 	m := e.loadManifest(t)
 	replayPath := filepath.Join(dir, "replay.sqlite")
-	if err := downloadSnapshot(ctx, e.store, m.Snapshot.Key, replayPath); err != nil {
+	if err := downloadSnapshot(ctx, e.store, m.Snapshot.Key, 0, replayPath); err != nil {
 		t.Fatalf("replay: downloadSnapshot: %v", err)
 	}
 	conn, err := sqlite.OpenConn(replayPath, sqlite.OpenReadWrite)
@@ -530,7 +530,7 @@ func TestDoUpdate_ConcurrentIncrements(t *testing.T) {
 	// Build one env per worker — separate local DBs, shared store.
 	mkEnv := func(id int) *testEnv {
 		localPath := filepath.Join(dir, fmt.Sprintf("worker-%d.sqlite", id))
-		downloadSnapshot(ctx, store, snapKey, localPath)
+		downloadSnapshot(ctx, store, snapKey, 0, localPath)
 		conn, _ := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
 		t.Cleanup(func() { conn.Close() })
 
@@ -579,7 +579,7 @@ func TestDoUpdate_ConcurrentIncrements(t *testing.T) {
 	}
 
 	replayPath := filepath.Join(dir, "replay.sqlite")
-	downloadSnapshot(ctx, store, finalM.Snapshot.Key, replayPath)
+	downloadSnapshot(ctx, store, finalM.Snapshot.Key, 0, replayPath)
 	rc, _ := sqlite.OpenConn(replayPath, sqlite.OpenReadWrite)
 	defer rc.Close()
 	applyLog(ctx, store, rc, finalM.Log, finalM.Snapshot.Seq)

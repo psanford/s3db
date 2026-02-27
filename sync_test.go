@@ -346,7 +346,7 @@ func TestDownloadSnapshot(t *testing.T) {
 
 	// Download to a new path.
 	dstPath := filepath.Join(dir, "dst.sqlite")
-	if err := downloadSnapshot(ctx, store, "snapshots/snap-1.sqlite", dstPath); err != nil {
+	if err := downloadSnapshot(ctx, store, "snapshots/snap-1.sqlite", 0, dstPath); err != nil {
 		t.Fatalf("downloadSnapshot: %v", err)
 	}
 
@@ -386,10 +386,10 @@ func TestDownloadSnapshot_ReplacesExisting(t *testing.T) {
 	store.Put(ctx, "snap-v2", bytes.NewReader(snapshotBytes(t, path2)), NoCondition)
 
 	// Download v1, then v2 over it.
-	if err := downloadSnapshot(ctx, store, "snap-v1", dstPath); err != nil {
+	if err := downloadSnapshot(ctx, store, "snap-v1", 0, dstPath); err != nil {
 		t.Fatalf("download v1: %v", err)
 	}
-	if err := downloadSnapshot(ctx, store, "snap-v2", dstPath); err != nil {
+	if err := downloadSnapshot(ctx, store, "snap-v2", 0, dstPath); err != nil {
 		t.Fatalf("download v2: %v", err)
 	}
 
@@ -404,7 +404,7 @@ func TestDownloadSnapshot_NotFound(t *testing.T) {
 	store := NewMemBlobStore()
 	dstPath := filepath.Join(t.TempDir(), "dst.sqlite")
 
-	err := downloadSnapshot(context.Background(), store, "missing", dstPath)
+	err := downloadSnapshot(context.Background(), store, "missing", 0, dstPath)
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
@@ -482,7 +482,7 @@ func TestApplyLog_Full(t *testing.T) {
 
 	// Download snapshot and apply full log.
 	localPath := filepath.Join(dir, "local.sqlite")
-	if err := downloadSnapshot(ctx, store, m.Snapshot.Key, localPath); err != nil {
+	if err := downloadSnapshot(ctx, store, m.Snapshot.Key, 0, localPath); err != nil {
 		t.Fatalf("downloadSnapshot: %v", err)
 	}
 	conn, err := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
@@ -521,7 +521,7 @@ func TestApplyLog_Incremental(t *testing.T) {
 
 	// Download snapshot and apply just cs1+cs2 (simulate local at seq=2).
 	localPath := filepath.Join(dir, "local.sqlite")
-	if err := downloadSnapshot(ctx, store, m.Snapshot.Key, localPath); err != nil {
+	if err := downloadSnapshot(ctx, store, m.Snapshot.Key, 0, localPath); err != nil {
 		t.Fatal(err)
 	}
 	conn, _ := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
@@ -573,7 +573,7 @@ func TestApplyLog_AllAlreadyApplied(t *testing.T) {
 	store, m := setupLogFixture(t, dir)
 
 	localPath := filepath.Join(dir, "local.sqlite")
-	downloadSnapshot(ctx, store, m.Snapshot.Key, localPath)
+	downloadSnapshot(ctx, store, m.Snapshot.Key, 0, localPath)
 	conn, _ := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
 	defer conn.Close()
 
@@ -604,7 +604,7 @@ func TestApplyLog_MissingChangeset(t *testing.T) {
 	store.Delete(ctx, "changesets/snap-0/cs-2.bin")
 
 	localPath := filepath.Join(dir, "local.sqlite")
-	downloadSnapshot(ctx, store, m.Snapshot.Key, localPath)
+	downloadSnapshot(ctx, store, m.Snapshot.Key, 0, localPath)
 	conn, _ := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
 	defer conn.Close()
 
@@ -612,8 +612,15 @@ func TestApplyLog_MissingChangeset(t *testing.T) {
 	if !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
-	// Should have stopped after cs1.
-	if seq != 1 {
-		t.Errorf("seq = %d, want 1 (stopped at last successful)", seq)
+	// Parallel fetch is all-or-nothing: any fetch failure means NOTHING
+	// is applied. Seq should still be fromSeq (0). This is a cleaner
+	// contract than the old sequential "apply what you can" behavior —
+	// the caller knows state is unchanged and can retry the whole batch.
+	if seq != 0 {
+		t.Errorf("seq = %d, want 0 (nothing applied on fetch failure)", seq)
+	}
+	// Verify conn is at snapshot state (nothing applied).
+	if got := queryInt(t, conn, `SELECT COUNT(*) FROM users`); got != 2 {
+		t.Errorf("row count = %d, want 2 (snapshot state)", got)
 	}
 }

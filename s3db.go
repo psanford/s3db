@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"zombiezen.com/go/sqlite"
+	"zombiezen.com/go/sqlite/sqlitex"
 )
 
 // DB is a concurrency-safe SQLite database backed by a BlobStore. It holds
@@ -89,7 +90,7 @@ func Open(ctx context.Context, store BlobStore, prefix string, opts ...Option) (
 	}
 
 	// Download snapshot and open connection.
-	if err := downloadSnapshot(ctx, store, m.Snapshot.Key, localPath); err != nil {
+	if err := downloadSnapshot(ctx, store, m.Snapshot.Key, m.Snapshot.Size, localPath); err != nil {
 		if ownLocalFile {
 			os.Remove(localPath)
 		}
@@ -166,10 +167,17 @@ func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string)
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
-	// OpenConn with OpenCreate writes the SQLite header.
+	// OpenConn with OpenCreate doesn't write the file header until the
+	// first operation. Run a no-op PRAGMA to force it — otherwise the
+	// snapshot is 0 bytes, which collides with our Size=0-means-unknown
+	// convention and is also a bit weird to have as a valid SQLite file.
 	conn, err := sqlite.OpenConn(tmpPath, sqlite.OpenReadWrite|sqlite.OpenCreate)
 	if err != nil {
 		return nil, "", fmt.Errorf("bootstrap: create empty db: %w", err)
+	}
+	if err := sqlitex.Execute(conn, "PRAGMA user_version = 0", nil); err != nil {
+		conn.Close()
+		return nil, "", fmt.Errorf("bootstrap: init header: %w", err)
 	}
 	conn.Close()
 
@@ -177,12 +185,7 @@ func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string)
 	// concurrent bootstraps write the same content to the same key — the
 	// second PUT is a harmless overwrite of identical bytes.
 	snapKey := prefix + "snapshots/snap-init.sqlite"
-	f, err := os.Open(tmpPath)
-	if err != nil {
-		return nil, "", err
-	}
-	_, err = store.Put(ctx, snapKey, f, NoCondition)
-	f.Close()
+	snapSize, err := uploadFile(ctx, store, snapKey, tmpPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("bootstrap: upload snapshot: %w", err)
 	}
@@ -191,7 +194,7 @@ func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string)
 	m := &Manifest{
 		Seq:           0,
 		SchemaVersion: 0,
-		Snapshot:      BlobRef{Key: snapKey, Seq: 0},
+		Snapshot:      BlobRef{Key: snapKey, Seq: 0, Size: snapSize},
 		Log:           nil,
 	}
 	etag, err := putManifest(ctx, store, manifestKey, m, PutCondition{IfNoneMatch: true})

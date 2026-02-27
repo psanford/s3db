@@ -38,14 +38,16 @@ type Manifest struct {
 
 // BlobRef points to an immutable blob in the store.
 type BlobRef struct {
-	Key string `json:"key"`
-	Seq int64  `json:"seq"`
+	Key  string `json:"key"`
+	Seq  int64  `json:"seq"`
+	Size int64  `json:"size,omitempty"` // bytes; 0 = unknown (old manifests, or size not recorded)
 }
 
 // LogEntry is one changeset in the log.
 type LogEntry struct {
-	Key string `json:"key"`
-	Seq int64  `json:"seq"`
+	Key  string `json:"key"`
+	Seq  int64  `json:"seq"`
+	Size int64  `json:"size,omitempty"` // bytes; 0 = unknown
 }
 
 // Epoch returns the identifier used to group changesets by their origin

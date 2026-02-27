@@ -51,7 +51,7 @@ func syncToManifest(ctx context.Context, cfg *commitConfig, st *commitState, loc
 		if err := st.conn.Close(); err != nil {
 			return fmt.Errorf("sync: close for refresh: %w", err)
 		}
-		if err := downloadSnapshot(ctx, cfg.store, m.Snapshot.Key, localPath); err != nil {
+		if err := downloadSnapshot(ctx, cfg.store, m.Snapshot.Key, m.Snapshot.Size, localPath); err != nil {
 			return err
 		}
 		conn, err := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
@@ -152,7 +152,7 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 
 		// Phase 2: CAS the manifest.
 		nextSeq := st.manifest.Seq + 1
-		newManifest := st.manifest.AppendLog(LogEntry{Key: csKey, Seq: nextSeq})
+		newManifest := st.manifest.AppendLog(LogEntry{Key: csKey, Seq: nextSeq, Size: int64(len(cs))})
 		newEtag, perr := putManifest(ctx, cfg.store, cfg.manifestKey, newManifest, PutCondition{IfMatch: st.etag})
 
 		if perr == nil {

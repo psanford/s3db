@@ -115,7 +115,8 @@ func (db *DB) applyMigration(ctx context.Context, m *Manifest, etag string, mig 
 		return fmt.Errorf("migration v%d: close for upload: %w", mig.Version, err)
 	}
 	snapKey := fmt.Sprintf("%ssnapshots/snap-mig-%d-%s.sqlite", db.cfg.prefix, mig.Version, uuid.NewString())
-	if uerr := uploadFile(ctx, db.cfg.store, snapKey, db.localPath); uerr != nil {
+	snapSize, uerr := uploadFile(ctx, db.cfg.store, snapKey, db.localPath)
+	if uerr != nil {
 		db.reopenConn()
 		return fmt.Errorf("migration v%d: upload snapshot: %w", mig.Version, uerr)
 	}
@@ -131,7 +132,7 @@ func (db *DB) applyMigration(ctx context.Context, m *Manifest, etag string, mig 
 	// bypassing the log entirely. A reader at seq N sees the same DATA
 	// before and after migration as long as they load the right snapshot,
 	// which the manifest guarantees.
-	newSnap := BlobRef{Key: snapKey, Seq: m.Seq}
+	newSnap := BlobRef{Key: snapKey, Seq: m.Seq, Size: snapSize}
 	newManifest := &Manifest{
 		Seq:           m.Seq,
 		SchemaVersion: mig.Version,

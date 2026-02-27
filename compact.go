@@ -61,7 +61,8 @@ func (db *DB) compactLocked(ctx context.Context) error {
 		}
 
 		snapKey := fmt.Sprintf("%ssnapshots/snap-%s.sqlite", db.cfg.prefix, uuid.NewString())
-		if err := uploadFile(ctx, db.cfg.store, snapKey, db.localPath); err != nil {
+		snapSize, err := uploadFile(ctx, db.cfg.store, snapKey, db.localPath)
+		if err != nil {
 			// Try to recover the conn before returning.
 			db.reopenConn()
 			return fmt.Errorf("compact: upload snapshot: %w", err)
@@ -73,7 +74,7 @@ func (db *DB) compactLocked(ctx context.Context) error {
 
 		// CAS the manifest. Seq stays the same; snapshot points at the new
 		// blob; log is empty. SchemaVersion preserved via WithSnapshot.
-		newSnap := BlobRef{Key: snapKey, Seq: db.st.manifest.Seq}
+		newSnap := BlobRef{Key: snapKey, Seq: db.st.manifest.Seq, Size: snapSize}
 		newManifest := db.st.manifest.WithSnapshot(newSnap)
 		newEtag, err := putManifest(ctx, db.cfg.store, db.cfg.manifestKey, newManifest, PutCondition{IfMatch: db.st.etag})
 
@@ -97,15 +98,22 @@ func (db *DB) compactLocked(ctx context.Context) error {
 	return fmt.Errorf("compact: %w", ErrConflict)
 }
 
-// uploadFile streams a local file to the store at the given key.
-func uploadFile(ctx context.Context, store BlobStore, key, path string) error {
+// uploadFile streams a local file to the store at the given key and returns
+// its size in bytes.
+func uploadFile(ctx context.Context, store BlobStore, key, path string) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
-	_, err = store.Put(ctx, key, f, NoCondition)
-	return err
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := store.Put(ctx, key, f, NoCondition); err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
 }
 
 // reopenConn reopens db.st.conn on db.localPath. Used after operations that

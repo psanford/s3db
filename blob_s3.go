@@ -3,6 +3,7 @@ package s3db
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -47,6 +48,21 @@ func (s *S3BlobStore) Get(ctx context.Context, key string) (io.ReadCloser, strin
 		return nil, "", err
 	}
 	return out.Body, etag.Normalize(aws.ToString(out.ETag)), nil
+}
+
+func (s *S3BlobStore) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error) {
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return out.Body, nil
 }
 
 func (s *S3BlobStore) Head(ctx context.Context, key string) (string, error) {
