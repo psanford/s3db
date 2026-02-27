@@ -95,7 +95,7 @@ func Open(ctx context.Context, store BlobStore, prefix string, opts ...Option) (
 		}
 		return nil, err
 	}
-	conn, err := sqlite.OpenConn(localPath, sqlite.OpenReadWrite)
+	conn, err := openLocalConn(localPath)
 	if err != nil {
 		if ownLocalFile {
 			os.Remove(localPath)
@@ -252,12 +252,12 @@ func (db *DB) Update(ctx context.Context, fn func(*sqlite.Conn) error) error {
 		return err
 	}
 
-	// Auto-compact hook. Runs synchronously in the lock for now — it's
-	// simple and correct. Stage 7 can make this async if the latency
-	// matters. Compaction errors are swallowed: the Update succeeded,
-	// and compaction can be retried later.
+	// Auto-compact hook. Runs synchronously in the lock — simple and
+	// correct, and compaction of a small DB is fast. Compaction errors
+	// are swallowed: the Update succeeded, and compaction can be retried
+	// later (by the next Update, or an explicit Compact call).
 	if db.opts.autoCompactAfter > 0 && len(db.st.manifest.Log) >= db.opts.autoCompactAfter {
-		_ = db.compact(ctx) // Stage 7
+		_ = db.compactLocked(ctx)
 	}
 
 	return nil
@@ -289,15 +289,16 @@ func (db *DB) Seq() int64 {
 	return db.st.localSeq
 }
 
-// --- Stubs for stages 7/8 --------------------------------------------------
-// These let s3db.go compile without the full compact/migrate implementations.
-// They'll be replaced in the respective stages.
-
-// compact is a placeholder for Stage 7.
-func (db *DB) compact(ctx context.Context) error {
-	_ = ctx
-	return nil // no-op until Stage 7
+// openLocalConn opens a read-write connection to the local SQLite file.
+// Centralized here so all opens use identical flags. We use explicit
+// OpenReadWrite (without OpenWAL) because WAL mode requires a -wal file
+// alongside the main file, which complicates snapshot upload/download.
+// DELETE journal mode (the SQLite default) keeps everything in one file.
+func openLocalConn(path string) (*sqlite.Conn, error) {
+	return sqlite.OpenConn(path, sqlite.OpenReadWrite)
 }
+
+// --- Stubs for Stage 8 -----------------------------------------------------
 
 // migrate is a placeholder for Stage 8. For now it just validates that
 // migrations have increasing version numbers — the schema-version guard
