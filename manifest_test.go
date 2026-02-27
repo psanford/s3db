@@ -11,12 +11,12 @@ import (
 
 // validManifest returns a manifest that passes Validate, for use as a
 // starting point in tests that want to break one specific invariant.
-func validManifest() *Manifest {
-	return &Manifest{
+func validManifest() *manifest {
+	return &manifest{
 		Seq:           12,
 		SchemaVersion: 3,
-		Snapshot:      BlobRef{Key: "snapshots/snap-abc.sqlite", Seq: 10},
-		Log: []LogEntry{
+		Snapshot:      blobRef{Key: "snapshots/snap-abc.sqlite", Seq: 10},
+		Log: []logEntry{
 			{Key: "changesets/snap-abc/cs-1.bin", Seq: 11},
 			{Key: "changesets/snap-abc/cs-2.bin", Seq: 12},
 		},
@@ -25,29 +25,29 @@ func validManifest() *Manifest {
 
 func TestManifest_Validate_OK(t *testing.T) {
 	m := validManifest()
-	if err := m.Validate(); err != nil {
+	if err := m.validate(); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
 func TestManifest_Validate_EmptyLog(t *testing.T) {
-	m := &Manifest{
+	m := &manifest{
 		Seq:      5,
-		Snapshot: BlobRef{Key: "snapshots/snap-x.sqlite", Seq: 5},
+		Snapshot: blobRef{Key: "snapshots/snap-x.sqlite", Seq: 5},
 		Log:      nil,
 	}
-	if err := m.Validate(); err != nil {
+	if err := m.validate(); err != nil {
 		t.Fatalf("empty log with matching seq should be valid: %v", err)
 	}
 }
 
 func TestManifest_Validate_FreshDB(t *testing.T) {
-	m := &Manifest{
+	m := &manifest{
 		Seq:      0,
-		Snapshot: BlobRef{Key: "snapshots/snap-init.sqlite", Seq: 0},
+		Snapshot: blobRef{Key: "snapshots/snap-init.sqlite", Seq: 0},
 		Log:      nil,
 	}
-	if err := m.Validate(); err != nil {
+	if err := m.validate(); err != nil {
 		t.Fatalf("fresh manifest should be valid: %v", err)
 	}
 }
@@ -55,17 +55,17 @@ func TestManifest_Validate_FreshDB(t *testing.T) {
 func TestManifest_Validate_EmptySnapshotKey(t *testing.T) {
 	m := validManifest()
 	m.Snapshot.Key = ""
-	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "snapshot key is empty") {
+	if err := m.validate(); err == nil || !strings.Contains(err.Error(), "snapshot key is empty") {
 		t.Errorf("expected snapshot-key error, got %v", err)
 	}
 }
 
 func TestManifest_Validate_NegativeSnapshotSeq(t *testing.T) {
-	m := &Manifest{
+	m := &manifest{
 		Seq:      -1,
-		Snapshot: BlobRef{Key: "snapshots/snap-x.sqlite", Seq: -1},
+		Snapshot: blobRef{Key: "snapshots/snap-x.sqlite", Seq: -1},
 	}
-	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "negative") {
+	if err := m.validate(); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Errorf("expected negative-seq error, got %v", err)
 	}
 }
@@ -73,7 +73,7 @@ func TestManifest_Validate_NegativeSnapshotSeq(t *testing.T) {
 func TestManifest_Validate_NegativeSchemaVersion(t *testing.T) {
 	m := validManifest()
 	m.SchemaVersion = -1
-	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "schema_version") {
+	if err := m.validate(); err == nil || !strings.Contains(err.Error(), "schema_version") {
 		t.Errorf("expected schema-version error, got %v", err)
 	}
 }
@@ -82,7 +82,7 @@ func TestManifest_Validate_LogGap(t *testing.T) {
 	m := validManifest()
 	m.Log[1].Seq = 13 // skip 12
 	m.Seq = 13
-	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "gap") {
+	if err := m.validate(); err == nil || !strings.Contains(err.Error(), "gap") {
 		t.Errorf("expected gap error, got %v", err)
 	}
 }
@@ -90,7 +90,7 @@ func TestManifest_Validate_LogGap(t *testing.T) {
 func TestManifest_Validate_LogOutOfOrder(t *testing.T) {
 	m := validManifest()
 	m.Log[0], m.Log[1] = m.Log[1], m.Log[0]
-	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "gap or out of order") {
+	if err := m.validate(); err == nil || !strings.Contains(err.Error(), "gap or out of order") {
 		t.Errorf("expected out-of-order error, got %v", err)
 	}
 }
@@ -98,7 +98,7 @@ func TestManifest_Validate_LogOutOfOrder(t *testing.T) {
 func TestManifest_Validate_LogDoesNotStartAfterSnapshot(t *testing.T) {
 	m := validManifest()
 	m.Log[0].Seq = 10 // same as snapshot.seq, should be snapshot.seq+1
-	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "want 11") {
+	if err := m.validate(); err == nil || !strings.Contains(err.Error(), "want 11") {
 		t.Errorf("expected log-start error, got %v", err)
 	}
 }
@@ -106,7 +106,7 @@ func TestManifest_Validate_LogDoesNotStartAfterSnapshot(t *testing.T) {
 func TestManifest_Validate_EmptyLogKey(t *testing.T) {
 	m := validManifest()
 	m.Log[0].Key = ""
-	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "empty key") {
+	if err := m.validate(); err == nil || !strings.Contains(err.Error(), "empty key") {
 		t.Errorf("expected empty-key error, got %v", err)
 	}
 }
@@ -114,18 +114,18 @@ func TestManifest_Validate_EmptyLogKey(t *testing.T) {
 func TestManifest_Validate_SeqMismatch(t *testing.T) {
 	m := validManifest()
 	m.Seq = 99
-	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "does not match") {
+	if err := m.validate(); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Errorf("expected seq-mismatch error, got %v", err)
 	}
 }
 
 func TestManifest_Validate_SeqMismatchEmptyLog(t *testing.T) {
-	m := &Manifest{
+	m := &manifest{
 		Seq:      7,
-		Snapshot: BlobRef{Key: "snapshots/snap-x.sqlite", Seq: 5},
+		Snapshot: blobRef{Key: "snapshots/snap-x.sqlite", Seq: 5},
 		Log:      nil,
 	}
-	if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "does not match") {
+	if err := m.validate(); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Errorf("expected seq-mismatch error for empty log, got %v", err)
 	}
 }
@@ -141,8 +141,8 @@ func TestManifest_Epoch(t *testing.T) {
 		{"snap.with.dots.sqlite", "snap.with.dots"},
 	}
 	for _, tc := range cases {
-		m := &Manifest{Snapshot: BlobRef{Key: tc.key}}
-		if got := m.Epoch(); got != tc.want {
+		m := &manifest{Snapshot: blobRef{Key: tc.key}}
+		if got := m.epoch(); got != tc.want {
 			t.Errorf("Epoch(%q) = %q, want %q", tc.key, got, tc.want)
 		}
 	}
@@ -155,7 +155,7 @@ func TestManifest_JSONRoundtrip(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	var got Manifest
+	var got manifest
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestManifest_JSONRoundtrip(t *testing.T) {
 func TestManifest_AppendLog(t *testing.T) {
 	m := validManifest() // seq 12, log has 11, 12
 
-	next := m.AppendLog(LogEntry{Key: "changesets/snap-abc/cs-3.bin", Seq: 13})
+	next := m.appendLog(logEntry{Key: "changesets/snap-abc/cs-3.bin", Seq: 13})
 
 	if next.Seq != 13 {
 		t.Errorf("Seq = %d, want 13", next.Seq)
@@ -193,7 +193,7 @@ func TestManifest_AppendLog(t *testing.T) {
 	if next.Log[2].Seq != 13 {
 		t.Errorf("Log[2].Seq = %d, want 13", next.Log[2].Seq)
 	}
-	if err := next.Validate(); err != nil {
+	if err := next.validate(); err != nil {
 		t.Errorf("result not valid: %v", err)
 	}
 
@@ -205,7 +205,7 @@ func TestManifest_AppendLog(t *testing.T) {
 
 func TestManifest_AppendLog_DoesNotAlias(t *testing.T) {
 	m := validManifest()
-	next := m.AppendLog(LogEntry{Key: "x", Seq: 13})
+	next := m.appendLog(logEntry{Key: "x", Seq: 13})
 
 	// Mutating next.Log should not affect m.Log.
 	next.Log[0].Key = "MUTATED"
@@ -217,8 +217,8 @@ func TestManifest_AppendLog_DoesNotAlias(t *testing.T) {
 func TestManifest_WithSnapshot(t *testing.T) {
 	m := validManifest() // seq 12, schema 3, log has 2 entries
 
-	newSnap := BlobRef{Key: "snapshots/snap-xyz.sqlite", Seq: 12}
-	next := m.WithSnapshot(newSnap)
+	newSnap := blobRef{Key: "snapshots/snap-xyz.sqlite", Seq: 12}
+	next := m.withSnapshot(newSnap)
 
 	if next.Seq != 12 {
 		t.Errorf("Seq = %d, want 12", next.Seq)
@@ -232,7 +232,7 @@ func TestManifest_WithSnapshot(t *testing.T) {
 	if len(next.Log) != 0 {
 		t.Errorf("len(Log) = %d, want 0", len(next.Log))
 	}
-	if err := next.Validate(); err != nil {
+	if err := next.validate(); err != nil {
 		t.Errorf("result not valid: %v", err)
 	}
 
@@ -288,7 +288,7 @@ func TestLoadManifest_InvalidManifest(t *testing.T) {
 	s := NewMemBlobStore()
 	ctx := context.Background()
 
-	bad := &Manifest{Seq: 99, Snapshot: BlobRef{Key: "x", Seq: 5}} // seq mismatch
+	bad := &manifest{Seq: 99, Snapshot: blobRef{Key: "x", Seq: 5}} // seq mismatch
 	data, _ := json.Marshal(bad)
 	s.Put(ctx, "m", bytes.NewReader(data), NoCondition)
 
@@ -302,7 +302,7 @@ func TestPutManifest_InvalidRejected(t *testing.T) {
 	s := NewMemBlobStore()
 	ctx := context.Background()
 
-	bad := &Manifest{Seq: 99, Snapshot: BlobRef{Key: "x", Seq: 5}}
+	bad := &manifest{Seq: 99, Snapshot: blobRef{Key: "x", Seq: 5}}
 	_, err := putManifest(ctx, s, "m", bad, NoCondition)
 	if err == nil {
 		t.Error("expected validation error, got nil")
@@ -322,7 +322,7 @@ func TestPutManifest_CAS(t *testing.T) {
 	m1 := validManifest()
 	etag1, _ := putManifest(ctx, s, key, m1, NoCondition)
 
-	m2 := m1.AppendLog(LogEntry{Key: "changesets/snap-abc/cs-3.bin", Seq: 13})
+	m2 := m1.appendLog(logEntry{Key: "changesets/snap-abc/cs-3.bin", Seq: 13})
 
 	// CAS with correct etag succeeds.
 	etag2, err := putManifest(ctx, s, key, m2, PutCondition{IfMatch: etag1})
@@ -331,7 +331,7 @@ func TestPutManifest_CAS(t *testing.T) {
 	}
 
 	// CAS with stale etag fails.
-	m3 := m2.AppendLog(LogEntry{Key: "changesets/snap-abc/cs-4.bin", Seq: 14})
+	m3 := m2.appendLog(logEntry{Key: "changesets/snap-abc/cs-4.bin", Seq: 14})
 	_, err = putManifest(ctx, s, key, m3, PutCondition{IfMatch: etag1})
 	if !errors.Is(err, ErrPreconditionFailed) {
 		t.Errorf("expected ErrPreconditionFailed with stale etag, got %v", err)

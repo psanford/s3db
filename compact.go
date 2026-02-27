@@ -74,8 +74,8 @@ func (db *DB) compactLocked(ctx context.Context) error {
 
 		// CAS the manifest. Seq stays the same; snapshot points at the new
 		// blob; log is empty. SchemaVersion preserved via WithSnapshot.
-		newSnap := BlobRef{Key: snapKey, Seq: db.st.manifest.Seq, Size: snapSize}
-		newManifest := db.st.manifest.WithSnapshot(newSnap)
+		newSnap := blobRef{Key: snapKey, Seq: db.st.manifest.Seq, Size: snapSize}
+		newManifest := db.st.manifest.withSnapshot(newSnap)
 		newEtag, err := putManifest(ctx, db.cfg.store, db.cfg.manifestKey, newManifest, PutCondition{IfMatch: db.st.etag})
 
 		if err == nil {

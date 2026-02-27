@@ -157,7 +157,7 @@ func Open(ctx context.Context, store BlobStore, prefix string, opts ...Option) (
 // bootstrap creates an initial empty database and manifest. Safe under
 // concurrent callers via If-None-Match on the manifest — exactly one
 // bootstrap succeeds; others fall back to loading the winner's manifest.
-func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string) (*Manifest, string, error) {
+func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string) (*manifest, string, error) {
 	// Build an empty SQLite file in a temp location.
 	tmp, err := os.CreateTemp("", "s3db-bootstrap-*.sqlite")
 	if err != nil {
@@ -191,10 +191,10 @@ func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string)
 	}
 
 	// CAS the manifest with If-None-Match.
-	m := &Manifest{
+	m := &manifest{
 		Seq:           0,
 		SchemaVersion: 0,
-		Snapshot:      BlobRef{Key: snapKey, Seq: 0, Size: snapSize},
+		Snapshot:      blobRef{Key: snapKey, Seq: 0, Size: snapSize},
 		Log:           nil,
 	}
 	etag, err := putManifest(ctx, store, manifestKey, m, PutCondition{IfNoneMatch: true})
@@ -282,8 +282,51 @@ func (db *DB) Close() error {
 	return err
 }
 
+// Stats describes the current state of the database. All fields are
+// point-in-time snapshots from the last-seen manifest — other writers
+// may have advanced the database since.
+type Stats struct {
+	// Seq is the logical version the local DB is synced to. Each
+	// committed write increments it by exactly 1.
+	Seq int64
+
+	// SchemaVersion is the highest migration version applied.
+	SchemaVersion int
+
+	// SnapshotSize is the current snapshot's size in bytes.
+	// 0 if unknown (old manifest).
+	SnapshotSize int64
+
+	// LogEntries is the number of changesets not yet compacted.
+	LogEntries int
+
+	// LogBytes is the total size of uncompacted changesets in bytes.
+	// May undercount if any log entries have unknown size.
+	LogBytes int64
+}
+
+// Stats returns a snapshot of the database's current state. Useful for
+// diagnostics, logging, and deciding when to trigger Compact/GC.
+func (db *DB) Stats() Stats {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	m := db.st.manifest
+	var logBytes int64
+	for _, e := range m.Log {
+		logBytes += e.Size
+	}
+	return Stats{
+		Seq:           db.st.localSeq,
+		SchemaVersion: m.SchemaVersion,
+		SnapshotSize:  m.Snapshot.Size,
+		LogEntries:    len(m.Log),
+		LogBytes:      logBytes,
+	}
+}
+
 // Seq returns the sequence number the local DB is currently synced to.
-// Useful for diagnostics.
+// Equivalent to Stats().Seq but cheaper. Useful for diagnostics.
 func (db *DB) Seq() int64 {
 	db.mu.Lock()
 	defer db.mu.Unlock()

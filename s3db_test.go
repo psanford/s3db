@@ -194,9 +194,9 @@ func seedSchema(t *testing.T, store BlobStore, prefix string) {
 		t.Fatalf("seed: put snapshot: %v", err)
 	}
 
-	m := &Manifest{
+	m := &manifest{
 		Seq:      0,
-		Snapshot: BlobRef{Key: snapKey, Seq: 0},
+		Snapshot: blobRef{Key: snapKey, Seq: 0},
 	}
 	if _, err := putManifest(ctx, store, prefix+"manifest.json", m, PutCondition{IfNoneMatch: true}); err != nil {
 		t.Fatalf("seed: put manifest: %v", err)
@@ -458,6 +458,59 @@ func TestDB_ConcurrentInstances(t *testing.T) {
 	want := int64(workers * incrementsPerWorker)
 	if final != want {
 		t.Errorf("final counter = %d, want %d — lost updates!", final, want)
+	}
+}
+
+// --- Stats -----------------------------------------------------------------
+
+func TestStats(t *testing.T) {
+	store := NewMemBlobStore()
+	ctx := context.Background()
+	db := openWithSchema(t, store, "mydb/")
+	defer db.Close()
+
+	// Fresh: empty log.
+	s := db.Stats()
+	if s.Seq != 0 {
+		t.Errorf("initial Seq = %d, want 0", s.Seq)
+	}
+	if s.LogEntries != 0 {
+		t.Errorf("initial LogEntries = %d, want 0", s.LogEntries)
+	}
+	if s.LogBytes != 0 {
+		t.Errorf("initial LogBytes = %d, want 0", s.LogBytes)
+	}
+
+	// After writes: log grows.
+	for i := 1; i <= 3; i++ {
+		db.Update(ctx, func(c *sqlite.Conn) error {
+			return sqlitex.Execute(c, fmt.Sprintf(`INSERT INTO users (id, name) VALUES (%d, 'u')`, i), nil)
+		})
+	}
+	s = db.Stats()
+	if s.Seq != 3 {
+		t.Errorf("Seq = %d, want 3", s.Seq)
+	}
+	if s.LogEntries != 3 {
+		t.Errorf("LogEntries = %d, want 3", s.LogEntries)
+	}
+	if s.LogBytes == 0 {
+		t.Error("LogBytes = 0, want > 0 (sizes should be recorded)")
+	}
+
+	// After compact: log empties, snapshot size changes.
+	if err := db.Compact(ctx); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	s = db.Stats()
+	if s.Seq != 3 {
+		t.Errorf("Seq after compact = %d, want 3 (unchanged)", s.Seq)
+	}
+	if s.LogEntries != 0 {
+		t.Errorf("LogEntries after compact = %d, want 0", s.LogEntries)
+	}
+	if s.SnapshotSize == 0 {
+		t.Error("SnapshotSize = 0 after compact, want > 0")
 	}
 }
 

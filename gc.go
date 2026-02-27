@@ -39,7 +39,7 @@ func (db *DB) GC(ctx context.Context) error {
 	for _, e := range m.Log {
 		liveChangesets[e.Key] = struct{}{}
 	}
-	currentEpoch := m.Epoch()
+	currentEpoch := m.epoch()
 
 	// Sweep changeset epochs. List all keys under changesets/, group by
 	// epoch prefix, delete any epoch that (a) is not the current epoch

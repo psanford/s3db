@@ -43,10 +43,10 @@ func newTestEnv(t *testing.T) *testEnv {
 	store.Put(ctx, snapKey, bytes.NewReader(snapshotBytes(t, snapPath)), NoCondition)
 
 	// Write initial manifest.
-	m := &Manifest{
+	m := &manifest{
 		Seq:           0,
 		SchemaVersion: 0,
-		Snapshot:      BlobRef{Key: snapKey, Seq: 0},
+		Snapshot:      blobRef{Key: snapKey, Seq: 0},
 		Log:           nil,
 	}
 	etag, err := putManifest(ctx, store, "mydb/manifest.json", m, NoCondition)
@@ -94,7 +94,7 @@ func (e *testEnv) update(t *testing.T, fn func(*sqlite.Conn) error) {
 }
 
 // loadManifest re-reads the manifest from the store (bypassing env state).
-func (e *testEnv) loadManifest(t *testing.T) *Manifest {
+func (e *testEnv) loadManifest(t *testing.T) *manifest {
 	t.Helper()
 	m, _, err := loadManifest(context.Background(), e.store, e.cfg.manifestKey)
 	if err != nil {
@@ -317,11 +317,11 @@ func concurrentWrite(t *testing.T, e *testEnv, fn func(*sqlite.Conn)) {
 	if err != nil {
 		t.Fatalf("concurrent: capture: %v", err)
 	}
-	csKey := fmt.Sprintf("%schangesets/%s/cs-concurrent-%d.bin", e.cfg.prefix, m.Epoch(), m.Seq+1)
+	csKey := fmt.Sprintf("%schangesets/%s/cs-concurrent-%d.bin", e.cfg.prefix, m.epoch(), m.Seq+1)
 	if _, err := e.store.Put(ctx, csKey, bytes.NewReader(cs), NoCondition); err != nil {
 		t.Fatalf("concurrent: put changeset: %v", err)
 	}
-	m2 := m.AppendLog(LogEntry{Key: csKey, Seq: m.Seq + 1})
+	m2 := m.appendLog(logEntry{Key: csKey, Seq: m.Seq + 1})
 	if _, err := putManifest(ctx, e.store, e.cfg.manifestKey, m2, PutCondition{IfMatch: etag}); err != nil {
 		t.Fatalf("concurrent: put manifest: %v", err)
 	}
@@ -524,7 +524,7 @@ func TestDoUpdate_ConcurrentIncrements(t *testing.T) {
 	snapKey := "mydb/snapshots/snap-0.sqlite"
 	store.Put(ctx, snapKey, bytes.NewReader(snapshotBytes(t, snapPath)), NoCondition)
 
-	m := &Manifest{Seq: 0, Snapshot: BlobRef{Key: snapKey, Seq: 0}}
+	m := &manifest{Seq: 0, Snapshot: blobRef{Key: snapKey, Seq: 0}}
 	putManifest(ctx, store, "mydb/manifest.json", m, NoCondition)
 
 	// Build one env per worker — separate local DBs, shared store.

@@ -169,7 +169,7 @@ func TestCompact_OpensNewEpoch(t *testing.T) {
 	})
 
 	m1, _, _ := loadManifest(ctx, store, "mydb/manifest.json")
-	oldEpoch := m1.Epoch()
+	oldEpoch := m1.epoch()
 
 	if err := db.Compact(ctx); err != nil {
 		t.Fatalf("Compact: %v", err)
@@ -181,7 +181,7 @@ func TestCompact_OpensNewEpoch(t *testing.T) {
 	})
 
 	m2, _, _ := loadManifest(ctx, store, "mydb/manifest.json")
-	newEpoch := m2.Epoch()
+	newEpoch := m2.epoch()
 	if newEpoch == oldEpoch {
 		t.Fatal("epoch did not change after compaction")
 	}
@@ -254,7 +254,7 @@ func TestGC_DeletesOldEpoch(t *testing.T) {
 		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (1, 'x')`, nil)
 	})
 	m1, _, _ := loadManifest(ctx, store, "mydb/manifest.json")
-	oldEpoch := m1.Epoch()
+	oldEpoch := m1.epoch()
 	oldSnap := m1.Snapshot.Key
 
 	if err := db.Compact(ctx); err != nil {
@@ -331,7 +331,7 @@ func TestGC_CleansOrphans(t *testing.T) {
 		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (1, 'x')`, nil)
 	})
 	m, _, _ := loadManifest(ctx, store, "mydb/manifest.json")
-	epoch := m.Epoch()
+	epoch := m.epoch()
 
 	// Inject an orphan in the current epoch.
 	orphanKey := "mydb/changesets/" + epoch + "/cs-orphan.bin"
@@ -364,7 +364,7 @@ func TestGC_PreservesStragglerEpoch(t *testing.T) {
 		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (1, 'x')`, nil)
 	})
 	m, _, _ := loadManifest(ctx, store, "mydb/manifest.json")
-	oldEpoch := m.Epoch()
+	oldEpoch := m.epoch()
 
 	// Manually construct the "straggler" scenario: manifest has a new
 	// snapshot but the log still references a changeset in the old epoch.
@@ -385,7 +385,7 @@ func TestGC_PreservesStragglerEpoch(t *testing.T) {
 		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (2, 'straggler')`, nil)
 	})
 	store.Put(ctx, stragglerKey, strings.NewReader(string(cs)), NoCondition)
-	m3 := m2.AppendLog(LogEntry{Key: stragglerKey, Seq: m2.Seq + 1})
+	m3 := m2.appendLog(logEntry{Key: stragglerKey, Seq: m2.Seq + 1})
 	putManifest(ctx, store, "mydb/manifest.json", m3, PutCondition{IfMatch: etag2})
 
 	// GC must preserve the old epoch because the straggler is live.

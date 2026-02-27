@@ -18,7 +18,7 @@ type commitState struct {
 	conn        *sqlite.Conn // local SQLite connection
 	localSeq    int64        // seq that conn is currently at
 	snapshotKey string       // which snapshot conn was loaded from
-	manifest    *Manifest    // last-seen manifest
+	manifest    *manifest    // last-seen manifest
 	etag        string       // ETag of last-seen manifest
 }
 
@@ -140,7 +140,7 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 				return nil // SAVEPOINT releases cleanly (err is nil)
 			}
 
-			epoch := st.manifest.Epoch()
+			epoch := st.manifest.epoch()
 			csKey = fmt.Sprintf("%schangesets/%s/cs-%s.bin", cfg.prefix, epoch, uuid.NewString())
 			if _, uerr := cfg.store.Put(ctx, csKey, bytes.NewReader(cs), NoCondition); uerr != nil {
 				err = fmt.Errorf("upload changeset: %w", uerr)
@@ -152,7 +152,7 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 
 		// Phase 2: CAS the manifest.
 		nextSeq := st.manifest.Seq + 1
-		newManifest := st.manifest.AppendLog(LogEntry{Key: csKey, Seq: nextSeq, Size: int64(len(cs))})
+		newManifest := st.manifest.appendLog(logEntry{Key: csKey, Seq: nextSeq, Size: int64(len(cs))})
 		newEtag, perr := putManifest(ctx, cfg.store, cfg.manifestKey, newManifest, PutCondition{IfMatch: st.etag})
 
 		if perr == nil {
@@ -249,7 +249,7 @@ func doUpdate(ctx context.Context, cfg *commitConfig, st *commitState, localPath
 // the commit in that case — st.manifest/etag have been updated but conn
 // has NOT been synced, so continuing would risk committing a changeset
 // whose before-image doesn't match the state at its predecessor seq.
-func rollbackAndResync(ctx context.Context, cfg *commitConfig, st *commitState, localPath string, m *Manifest, etag string, release *func(*error)) error {
+func rollbackAndResync(ctx context.Context, cfg *commitConfig, st *commitState, localPath string, m *manifest, etag string, release *func(*error)) error {
 	rollbackErr := errors.New("rollback")
 	(*release)(&rollbackErr)
 	*release = nil
@@ -262,7 +262,7 @@ func rollbackAndResync(ctx context.Context, cfg *commitConfig, st *commitState, 
 // applyMissingEntry fetches and applies one log entry. Separated for error
 // context and to buffer the changeset before applying (changesets are small;
 // buffering keeps the store connection open for the minimum time).
-func applyMissingEntry(ctx context.Context, store BlobStore, conn *sqlite.Conn, e LogEntry) error {
+func applyMissingEntry(ctx context.Context, store BlobStore, conn *sqlite.Conn, e logEntry) error {
 	rc, _, err := store.Get(ctx, e.Key)
 	if err != nil {
 		return fmt.Errorf("fetch changeset seq=%d: %w", e.Seq, err)

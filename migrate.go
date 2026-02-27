@@ -90,7 +90,7 @@ func (db *DB) runMigrations(ctx context.Context) error {
 // snapshot, CAS manifest with bumped schema_version. Returns
 // ErrPreconditionFailed if the CAS loses (caller should re-check and retry
 // or skip).
-func (db *DB) applyMigration(ctx context.Context, m *Manifest, etag string, mig *Migration) error {
+func (db *DB) applyMigration(ctx context.Context, m *manifest, etag string, mig *Migration) error {
 	// Sync local DB to the manifest we're migrating from. This ensures
 	// Up runs against the exact state the manifest describes.
 	db.st.manifest = m
@@ -132,8 +132,8 @@ func (db *DB) applyMigration(ctx context.Context, m *Manifest, etag string, mig 
 	// bypassing the log entirely. A reader at seq N sees the same DATA
 	// before and after migration as long as they load the right snapshot,
 	// which the manifest guarantees.
-	newSnap := BlobRef{Key: snapKey, Seq: m.Seq, Size: snapSize}
-	newManifest := &Manifest{
+	newSnap := blobRef{Key: snapKey, Seq: m.Seq, Size: snapSize}
+	newManifest := &manifest{
 		Seq:           m.Seq,
 		SchemaVersion: mig.Version,
 		Snapshot:      newSnap,

@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// Manifest is the single source of truth for the database state. It points
+// manifest is the single source of truth for the database state. It points
 // to an immutable snapshot and an ordered log of changesets to apply on top.
 // The manifest is the only object written with contention; everything it
 // references is write-once.
@@ -18,7 +18,7 @@ import (
 //   - Snapshot.Key is non-empty
 //   - Log entries have strictly increasing Seq, starting at Snapshot.Seq+1
 //   - Seq equals Snapshot.Seq if Log is empty, else the last Log entry's Seq
-type Manifest struct {
+type manifest struct {
 	// Seq is the logical version of the database. It increases by exactly 1
 	// with each committed write. It never has gaps and never goes backward.
 	Seq int64 `json:"seq"`
@@ -29,35 +29,35 @@ type Manifest struct {
 
 	// Snapshot is the base full-database file. Its Seq is the highest
 	// sequence number whose changes are materialized in the snapshot.
-	Snapshot BlobRef `json:"snapshot"`
+	Snapshot blobRef `json:"snapshot"`
 
 	// Log is the ordered list of changesets to apply on top of Snapshot
 	// to reach the current state at Seq.
-	Log []LogEntry `json:"log"`
+	Log []logEntry `json:"log"`
 }
 
-// BlobRef points to an immutable blob in the store.
-type BlobRef struct {
+// blobRef points to an immutable blob in the store.
+type blobRef struct {
 	Key  string `json:"key"`
 	Seq  int64  `json:"seq"`
 	Size int64  `json:"size,omitempty"` // bytes; 0 = unknown (old manifests, or size not recorded)
 }
 
-// LogEntry is one changeset in the log.
-type LogEntry struct {
+// logEntry is one changeset in the log.
+type logEntry struct {
 	Key  string `json:"key"`
 	Seq  int64  `json:"seq"`
 	Size int64  `json:"size,omitempty"` // bytes; 0 = unknown
 }
 
-// Epoch returns the identifier used to group changesets by their origin
+// epoch returns the identifier used to group changesets by their origin
 // snapshot. It is the basename of the snapshot key with the extension
 // stripped, e.g. "snapshots/snap-abc.sqlite" → "snap-abc".
 //
 // Changesets for the current epoch are written under "changesets/<epoch>/".
 // When a snapshot is superseded and its epoch contains no live log entries,
 // the entire prefix can be deleted — see GC in DESIGN.md.
-func (m *Manifest) Epoch() string {
+func (m *manifest) epoch() string {
 	base := path.Base(m.Snapshot.Key)
 	if i := strings.LastIndex(base, "."); i > 0 {
 		return base[:i]
@@ -65,9 +65,9 @@ func (m *Manifest) Epoch() string {
 	return base
 }
 
-// Validate checks the manifest's internal consistency. It returns an error
+// validate checks the manifest's internal consistency. It returns an error
 // describing the first violated invariant, or nil if the manifest is valid.
-func (m *Manifest) Validate() error {
+func (m *manifest) validate() error {
 	if m.Snapshot.Key == "" {
 		return fmt.Errorf("manifest: snapshot key is empty")
 	}
@@ -101,23 +101,23 @@ func (m *Manifest) Validate() error {
 	return nil
 }
 
-// AppendLog returns a new manifest with entry appended to the log and Seq
+// appendLog returns a new manifest with entry appended to the log and Seq
 // advanced to entry.Seq. It does not validate; call Validate on the result
 // before committing. The receiver is not modified.
-func (m *Manifest) AppendLog(entry LogEntry) *Manifest {
+func (m *manifest) appendLog(entry logEntry) *manifest {
 	out := *m
-	out.Log = make([]LogEntry, len(m.Log)+1)
+	out.Log = make([]logEntry, len(m.Log)+1)
 	copy(out.Log, m.Log)
 	out.Log[len(m.Log)] = entry
 	out.Seq = entry.Seq
 	return &out
 }
 
-// WithSnapshot returns a new manifest with the given snapshot and an empty
+// withSnapshot returns a new manifest with the given snapshot and an empty
 // log. Seq is set to snapshot.Seq. Used by compaction and migrations.
 // The receiver is not modified.
-func (m *Manifest) WithSnapshot(snapshot BlobRef) *Manifest {
-	return &Manifest{
+func (m *manifest) withSnapshot(snapshot blobRef) *manifest {
+	return &manifest{
 		Seq:           snapshot.Seq,
 		SchemaVersion: m.SchemaVersion,
 		Snapshot:      snapshot,
@@ -127,17 +127,17 @@ func (m *Manifest) WithSnapshot(snapshot BlobRef) *Manifest {
 
 // loadManifest fetches and parses the manifest from the store. It validates
 // the result before returning.
-func loadManifest(ctx context.Context, store BlobStore, key string) (*Manifest, string, error) {
+func loadManifest(ctx context.Context, store BlobStore, key string) (*manifest, string, error) {
 	rc, etag, err := store.Get(ctx, key)
 	if err != nil {
 		return nil, "", err
 	}
 	defer rc.Close()
-	var m Manifest
+	var m manifest
 	if err := json.NewDecoder(rc).Decode(&m); err != nil {
 		return nil, "", fmt.Errorf("manifest: decode: %w", err)
 	}
-	if err := m.Validate(); err != nil {
+	if err := m.validate(); err != nil {
 		return nil, "", err
 	}
 	return &m, etag, nil
@@ -146,8 +146,8 @@ func loadManifest(ctx context.Context, store BlobStore, key string) (*Manifest, 
 // putManifest validates and writes the manifest to the store. Returns the
 // new ETag on success. cond is typically either IfMatch (CAS during commit)
 // or IfNoneMatch (bootstrap).
-func putManifest(ctx context.Context, store BlobStore, key string, m *Manifest, cond PutCondition) (string, error) {
-	if err := m.Validate(); err != nil {
+func putManifest(ctx context.Context, store BlobStore, key string, m *manifest, cond PutCondition) (string, error) {
+	if err := m.validate(); err != nil {
 		return "", err
 	}
 	body, err := json.Marshal(m)

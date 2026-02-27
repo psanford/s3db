@@ -130,9 +130,9 @@ func (o *offsetWriter) Write(p []byte) (int, error) {
 //
 // Returns the seq of the last applied entry, or fromSeq if no entries were
 // applied (log was empty or all entries were at or before fromSeq).
-func applyLog(ctx context.Context, store BlobStore, conn *sqlite.Conn, log []LogEntry, fromSeq int64) (int64, error) {
+func applyLog(ctx context.Context, store BlobStore, conn *sqlite.Conn, log []logEntry, fromSeq int64) (int64, error) {
 	// Collect entries we need.
-	var need []LogEntry
+	var need []logEntry
 	for _, e := range log {
 		if e.Seq > fromSeq {
 			need = append(need, e)

@@ -420,7 +420,7 @@ func TestDownloadSnapshot_NotFound(t *testing.T) {
 // setupLogFixture builds a snapshot at seq=0 (2 initial rows) and three
 // changesets at seq 1, 2, 3 in the store. Returns the store and a manifest
 // describing it.
-func setupLogFixture(t *testing.T, dir string) (*MemBlobStore, *Manifest) {
+func setupLogFixture(t *testing.T, dir string) (*MemBlobStore, *manifest) {
 	t.Helper()
 	ctx := context.Background()
 	store := NewMemBlobStore()
@@ -460,16 +460,16 @@ func setupLogFixture(t *testing.T, dir string) (*MemBlobStore, *Manifest) {
 	store.Put(ctx, "changesets/snap-0/cs-2.bin", bytes.NewReader(cs2), NoCondition)
 	store.Put(ctx, "changesets/snap-0/cs-3.bin", bytes.NewReader(cs3), NoCondition)
 
-	m := &Manifest{
+	m := &manifest{
 		Seq:      3,
-		Snapshot: BlobRef{Key: "snapshots/snap-0.sqlite", Seq: 0},
-		Log: []LogEntry{
+		Snapshot: blobRef{Key: "snapshots/snap-0.sqlite", Seq: 0},
+		Log: []logEntry{
 			{Key: "changesets/snap-0/cs-1.bin", Seq: 1},
 			{Key: "changesets/snap-0/cs-2.bin", Seq: 2},
 			{Key: "changesets/snap-0/cs-3.bin", Seq: 3},
 		},
 	}
-	if err := m.Validate(); err != nil {
+	if err := m.validate(); err != nil {
 		t.Fatalf("fixture manifest invalid: %v", err)
 	}
 	return store, m
