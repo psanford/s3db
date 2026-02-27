@@ -308,3 +308,202 @@ func TestCapture_Roundtrip(t *testing.T) {
 		t.Errorf("replica balance = %d, want 200", repBal)
 	}
 }
+
+// --- PK-less table detection ------------------------------------------------
+
+// openPKlessDB creates a database with a mix of PK and PK-less tables.
+func openPKlessDB(t *testing.T, path string) *sqlite.Conn {
+	t.Helper()
+	conn, err := sqlite.OpenConn(path, sqlite.OpenReadWrite|sqlite.OpenCreate)
+	if err != nil {
+		t.Fatalf("OpenConn: %v", err)
+	}
+	mustExec(t, conn, `CREATE TABLE good (id INTEGER PRIMARY KEY, val TEXT)`)
+	mustExec(t, conn, `CREATE TABLE bad (name TEXT, val TEXT)`) // no PK
+	mustExec(t, conn, `CREATE TABLE also_bad (x INTEGER, y INTEGER)`) // no PK
+	mustExec(t, conn, `INSERT INTO bad (name, val) VALUES ('k', 'v1')`)
+	return conn
+}
+
+func TestCapture_PKlessTable_Error(t *testing.T) {
+	// Modifying a PK-less table should return ErrUnrecordedChanges
+	// rather than silently producing an empty changeset.
+	conn := openPKlessDB(t, filepath.Join(t.TempDir(), "db.sqlite"))
+	defer conn.Close()
+
+	_, err := capture(conn, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `UPDATE bad SET val = 'v2' WHERE name = 'k'`, nil)
+	})
+
+	var urc *ErrUnrecordedChanges
+	if !errors.As(err, &urc) {
+		t.Fatalf("expected ErrUnrecordedChanges, got %v", err)
+	}
+	if urc.Rows != 1 {
+		t.Errorf("Rows = %d, want 1", urc.Rows)
+	}
+	// Both PK-less tables should be listed (we report all candidates,
+	// not just the one that was modified — we can't tell which without
+	// more machinery, and listing all is more helpful for fixing the schema).
+	if len(urc.PKlessTables) != 2 {
+		t.Errorf("PKlessTables = %v, want 2 tables", urc.PKlessTables)
+	}
+	t.Logf("error message: %v", err)
+}
+
+func TestCapture_PKlessTable_InsertError(t *testing.T) {
+	// INSERT into PK-less table should also be caught.
+	conn := openPKlessDB(t, filepath.Join(t.TempDir(), "db.sqlite"))
+	defer conn.Close()
+
+	_, err := capture(conn, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO also_bad (x, y) VALUES (1, 2)`, nil)
+	})
+
+	var urc *ErrUnrecordedChanges
+	if !errors.As(err, &urc) {
+		t.Fatalf("expected ErrUnrecordedChanges, got %v", err)
+	}
+}
+
+func TestCapture_PKlessTable_GoodTableOK(t *testing.T) {
+	// Modifying only the PK table should work fine even though PK-less
+	// tables exist in the schema.
+	conn := openPKlessDB(t, filepath.Join(t.TempDir(), "db.sqlite"))
+	defer conn.Close()
+
+	cs, err := capture(conn, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO good (id, val) VALUES (1, 'x')`, nil)
+	})
+	if err != nil {
+		t.Fatalf("capture on PK table: %v", err)
+	}
+	if len(cs) == 0 {
+		t.Fatal("changeset is empty")
+	}
+}
+
+func TestCapture_NoOpUpdate_NoFalsePositive(t *testing.T) {
+	// A no-op UPDATE on a PK table increments total_changes but the
+	// session correctly produces an empty changeset (no actual value
+	// change). This must NOT trigger ErrUnrecordedChanges — the check
+	// only fires when PK-less tables exist in the schema. With all-PK
+	// schema, empty changeset after row modification is assumed benign.
+	conn := openTestDB(t, filepath.Join(t.TempDir(), "db.sqlite"))
+	defer conn.Close()
+	mustExec(t, conn, `INSERT INTO users (id, name, balance) VALUES (1, 'a', 100)`)
+
+	cs, err := capture(conn, func(c *sqlite.Conn) error {
+		// Same value — SQLite says 1 row affected, session says no change.
+		return sqlitex.Execute(c, `UPDATE users SET balance = 100 WHERE id = 1`, nil)
+	})
+	if err != nil {
+		t.Fatalf("no-op update on PK table should not error: %v", err)
+	}
+	if cs != nil {
+		t.Errorf("no-op update should produce nil changeset, got %d bytes", len(cs))
+	}
+}
+
+func TestCapture_PKless_NoOpUpdate_Conservative(t *testing.T) {
+	// Edge case: no-op UPDATE on a PK-less table. total_changes advances,
+	// changeset is empty, PK-less tables exist — so we DO error. This is
+	// a false positive in the strictest sense (the change was a no-op so
+	// nothing was lost), but it's the conservative choice: the user has
+	// a schema problem that WILL bite them on a real change, so flag it.
+	conn := openPKlessDB(t, filepath.Join(t.TempDir(), "db.sqlite"))
+	defer conn.Close()
+
+	_, err := capture(conn, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `UPDATE bad SET val = 'v1' WHERE name = 'k'`, nil) // val already 'v1'
+	})
+
+	var urc *ErrUnrecordedChanges
+	if !errors.As(err, &urc) {
+		t.Fatalf("expected ErrUnrecordedChanges (conservative), got %v", err)
+	}
+}
+
+func TestFindPKlessTables(t *testing.T) {
+	conn := openPKlessDB(t, filepath.Join(t.TempDir(), "db.sqlite"))
+	defer conn.Close()
+
+	got := findPKlessTables(conn)
+	want := []string{"also_bad", "bad"} // alphabetical
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestFindPKlessTables_AllGood(t *testing.T) {
+	conn := openTestDB(t, filepath.Join(t.TempDir(), "db.sqlite"))
+	defer conn.Close()
+
+	got := findPKlessTables(conn)
+	if len(got) != 0 {
+		t.Errorf("got %v, want empty (test schema has PKs)", got)
+	}
+}
+
+// --- Integration with Update ------------------------------------------------
+
+func TestUpdate_PKlessTable_Error(t *testing.T) {
+	// End-to-end: Update on a PK-less table should return
+	// ErrUnrecordedChanges, and the local change should be rolled back
+	// (SAVEPOINT handling).
+	store := NewMemBlobStore()
+	ctx := t.Context()
+
+	// Seed a DB with a PK-less table via Init.
+	srcPath := filepath.Join(t.TempDir(), "src.sqlite")
+	conn, _ := sqlite.OpenConn(srcPath, sqlite.OpenReadWrite|sqlite.OpenCreate)
+	sqlitex.ExecuteScript(conn, `
+		CREATE TABLE good (id INTEGER PRIMARY KEY, val TEXT);
+		CREATE TABLE bad (name TEXT, val TEXT);
+		INSERT INTO bad (name, val) VALUES ('k', 'initial');
+	`, nil)
+	conn.Close()
+
+	if err := Init(ctx, store, "mydb/", srcPath); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	db, err := Open(ctx, store, "mydb/")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Try to update the PK-less table.
+	err = db.Update(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `UPDATE bad SET val = 'changed' WHERE name = 'k'`, nil)
+	})
+
+	var urc *ErrUnrecordedChanges
+	if !errors.As(err, &urc) {
+		t.Fatalf("expected ErrUnrecordedChanges, got %v", err)
+	}
+
+	// The local change should have been rolled back (Update's SAVEPOINT
+	// rolls back on error).
+	var val string
+	db.View(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT val FROM bad WHERE name = 'k'`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { val = s.ColumnText(0); return nil },
+		})
+	})
+	if val != "initial" {
+		t.Errorf("val = %q, want 'initial' (failed Update should roll back)", val)
+	}
+
+	// Manifest should be unchanged (nothing committed).
+	m, _, _ := loadManifest(ctx, store, "mydb/manifest.json")
+	if len(m.Log) != 0 {
+		t.Errorf("log len = %d, want 0 (nothing should have been committed)", len(m.Log))
+	}
+}
