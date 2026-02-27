@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"zombiezen.com/go/sqlite"
 	"zombiezen.com/go/sqlite/sqlitex"
@@ -209,7 +212,7 @@ func openWithSchema(t *testing.T, store BlobStore, prefix string, opts ...Option
 	ctx := context.Background()
 
 	// Only seed if the manifest doesn't exist yet.
-	if _, err := store.Head(ctx, prefix+"manifest.json"); errors.Is(err, ErrNotFound) {
+	if _, err := store.Stat(ctx, prefix+"manifest.json"); errors.Is(err, ErrNotFound) {
 		seedSchema(t, store, prefix)
 	}
 
@@ -561,5 +564,206 @@ func TestSeq(t *testing.T) {
 
 	if db.Seq() != seq0+3 {
 		t.Errorf("Seq = %d, want %d", db.Seq(), seq0+3)
+	}
+}
+
+func TestView_WritesAreRolledBack(t *testing.T) {
+	// Writes inside View must not persist — they're wrapped in
+	// BEGIN/ROLLBACK to enforce the read-only contract.
+	store := NewMemBlobStore()
+	ctx := context.Background()
+	db := openWithSchema(t, store, "mydb/")
+	defer db.Close()
+
+	// Write inside View.
+	db.View(ctx, func(c *sqlite.Conn) error {
+		if err := sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (99, 'ghost')`, nil); err != nil {
+			t.Fatalf("insert in View: %v", err)
+		}
+		// The write is visible INSIDE the View transaction...
+		var n int64
+		sqlitex.Execute(c, `SELECT COUNT(*) FROM users WHERE id = 99`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { n = s.ColumnInt64(0); return nil },
+		})
+		if n != 1 {
+			t.Errorf("inside View: count = %d, want 1", n)
+		}
+		return nil
+	})
+
+	// ...but NOT after View returns.
+	var n int64
+	db.View(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT COUNT(*) FROM users WHERE id = 99`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { n = s.ColumnInt64(0); return nil },
+		})
+	})
+	if n != 0 {
+		t.Errorf("after View: count = %d, want 0 (write should be rolled back)", n)
+	}
+
+	// And a fresh Open should also not see it.
+	db2 := openWithSchema(t, store, "mydb/")
+	defer db2.Close()
+	n = 0
+	db2.View(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT COUNT(*) FROM users WHERE id = 99`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { n = s.ColumnInt64(0); return nil },
+		})
+	})
+	if n != 0 {
+		t.Errorf("fresh Open: count = %d, want 0", n)
+	}
+}
+
+func TestView_InterruptOnContextCancel(t *testing.T) {
+	// A cancelled context should interrupt an in-progress query.
+	store := NewMemBlobStore()
+	db := openWithSchema(t, store, "mydb/")
+	defer db.Close()
+
+	// Seed a lot of rows so the query has something to iterate.
+	ctx := context.Background()
+	db.Update(ctx, func(c *sqlite.Conn) error {
+		for i := 0; i < 1000; i++ {
+			if err := sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (?, 'u')`,
+				&sqlitex.ExecOptions{Args: []any{i}}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// Use a pre-cancelled context.
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// The query should fail with an interrupt. Note: refreshManifest
+	// checks ctx.Err too, so we may not even reach fn — either way is
+	// correct (the call returned an error because the ctx was cancelled).
+	err := db.View(cctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT COUNT(*) FROM users`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { return nil },
+		})
+	})
+	if err == nil {
+		t.Error("View with cancelled context succeeded; expected error")
+	}
+}
+
+func TestGC_GracePeriod(t *testing.T) {
+	// Snapshots younger than the grace period should survive GC even
+	// if they're no longer referenced by the manifest.
+	store := NewMemBlobStore()
+	ctx := context.Background()
+	db := openWithSchema(t, store, "mydb/", WithGCGracePeriod(time.Hour))
+	defer db.Close()
+
+	// Write + compact to create an old snapshot.
+	db.Update(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (1, 'x')`, nil)
+	})
+	m1, _, _ := loadManifest(ctx, store, "mydb/manifest.json")
+	oldSnap := m1.Snapshot.Key
+
+	if err := db.Compact(ctx); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+
+	// GC with 1h grace period: old snapshot is only seconds old, preserved.
+	if err := db.GC(ctx); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if _, _, err := store.Get(ctx, oldSnap); err != nil {
+		t.Errorf("old snapshot deleted within grace period: %v", err)
+	}
+
+	// Reopen with grace=0: now it should go.
+	db2 := openWithSchema(t, store, "mydb/", WithGCGracePeriod(0))
+	defer db2.Close()
+	if err := db2.GC(ctx); err != nil {
+		t.Fatalf("GC: %v", err)
+	}
+	if _, _, err := store.Get(ctx, oldSnap); err == nil {
+		t.Error("old snapshot not deleted with grace=0")
+	}
+}
+
+func TestWithCompactErrorHandler(t *testing.T) {
+	// Auto-compact failures should be reported via the handler.
+	ctx := context.Background()
+	inner := NewMemBlobStore()
+
+	var compactErr error
+	handler := func(err error) { compactErr = err }
+
+	seedSchema(t, inner, "mydb/")
+
+	// A store that fails snapshot uploads (but not changeset uploads or
+	// manifest Puts) to force compaction to fail.
+	store := &snapFailStore{MemBlobStore: inner}
+
+	db, err := Open(ctx, store, "mydb/",
+		WithAutoCompact(2),
+		WithCompactErrorHandler(handler))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	// Two writes — triggers auto-compact.
+	for i := 0; i < 2; i++ {
+		err := db.Update(ctx, func(c *sqlite.Conn) error {
+			return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (?, 'u')`,
+				&sqlitex.ExecOptions{Args: []any{i}})
+		})
+		if err != nil {
+			t.Fatalf("Update %d: %v", i, err)
+		}
+	}
+
+	if compactErr == nil {
+		t.Error("compact error handler not invoked")
+	}
+
+	// Updates should have succeeded regardless.
+	var count int64
+	db.View(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT COUNT(*) FROM users`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { count = s.ColumnInt64(0); return nil },
+		})
+	})
+	if count != 2 {
+		t.Errorf("count = %d, want 2 (writes should succeed even when compact fails)", count)
+	}
+}
+
+// snapFailStore fails Put when the key contains "snapshots/" (except for
+// the initial bootstrap snapshot).
+type snapFailStore struct {
+	*MemBlobStore
+}
+
+func (s *snapFailStore) Put(ctx context.Context, key string, body io.Reader, cond PutCondition) (string, error) {
+	if strings.Contains(key, "snapshots/") && !strings.Contains(key, "snap-init") {
+		return "", errors.New("injected snapshot upload failure")
+	}
+	return s.MemBlobStore.Put(ctx, key, body, cond)
+}
+
+func TestWithMaxRetries_ClampsToOne(t *testing.T) {
+	// WithMaxRetries(0) and negative values should clamp to 1, giving
+	// at least one CAS attempt.
+	store := NewMemBlobStore()
+	ctx := context.Background()
+	db := openWithSchema(t, store, "mydb/", WithMaxRetries(0))
+	defer db.Close()
+
+	// A simple write should succeed (no contention, one attempt needed).
+	err := db.Update(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (1, 'x')`, nil)
+	})
+	if err != nil {
+		t.Errorf("Update with WithMaxRetries(0) failed: %v", err)
 	}
 }

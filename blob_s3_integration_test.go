@@ -112,9 +112,9 @@ func TestS3BlobStore_NotFound(t *testing.T) {
 		t.Errorf("Get: expected ErrNotFound, got %v", err)
 	}
 
-	_, err = store.Head(ctx, prefix+"nonexistent")
+	_, err = store.Stat(ctx, prefix+"nonexistent")
 	if err != ErrNotFound {
-		t.Errorf("Head: expected ErrNotFound, got %v", err)
+		t.Errorf("Stat: expected ErrNotFound, got %v", err)
 	}
 }
 

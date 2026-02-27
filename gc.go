@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // GC deletes unreachable blobs: epoch prefixes whose changesets have all
@@ -75,20 +76,32 @@ func (db *DB) GC(ctx context.Context) error {
 		}
 	}
 
-	// Sweep old snapshots. Any snapshot that is not the current one is
-	// garbage. (A more conservative policy would add a grace period to
-	// protect in-flight readers holding an old manifest, but since Open
-	// downloads the snapshot before using it, and the snapshot download
-	// is atomic from S3's perspective, the window is very small. If this
-	// becomes a concern, add a time-based check on object LastModified.)
+	// Sweep old snapshots. Any snapshot that is not the current one AND
+	// is older than the grace period is garbage. The grace period protects
+	// in-flight readers who loaded an old manifest just before a compaction
+	// swapped the snapshot — they may still be downloading the old one.
 	snapPrefix := db.cfg.prefix + "snapshots/"
 	snapKeys, err := db.cfg.store.List(ctx, snapPrefix)
 	if err != nil {
 		return fmt.Errorf("gc: list snapshots: %w", err)
 	}
+	grace := db.opts.gcGracePeriod
+	now := time.Now()
 	for _, k := range snapKeys {
 		if k == m.Snapshot.Key {
 			continue
+		}
+		if grace > 0 {
+			info, err := db.cfg.store.Stat(ctx, k)
+			if err != nil {
+				// If we can't stat it, leave it alone. It'll get picked
+				// up on the next GC run (or something is genuinely wrong
+				// and the operator should investigate).
+				continue
+			}
+			if now.Sub(info.LastModified) < grace {
+				continue // too young to delete
+			}
 		}
 		if err := db.cfg.store.Delete(ctx, k); err != nil {
 			return fmt.Errorf("gc: delete snapshot %s: %w", k, err)

@@ -6,6 +6,7 @@ package s3db
 import (
 	"context"
 	"io"
+	"time"
 )
 
 // BlobStore is the storage abstraction. Production uses S3; tests use an
@@ -31,9 +32,9 @@ type BlobStore interface {
 	// if the key does not exist.
 	GetRange(ctx context.Context, key string, start, end int64) (body io.ReadCloser, err error)
 
-	// Head returns the ETag of the object at key without fetching the body.
-	// Returns ErrNotFound if the key does not exist.
-	Head(ctx context.Context, key string) (etag string, err error)
+	// Stat returns metadata for the object at key without fetching the
+	// body. Returns ErrNotFound if the key does not exist.
+	Stat(ctx context.Context, key string) (info BlobInfo, err error)
 
 	// Put writes body to key, subject to cond. The body reader is drained
 	// by the store. Returns the new ETag on success, ErrPreconditionFailed
@@ -54,8 +55,15 @@ type BlobStore interface {
 	DeletePrefix(ctx context.Context, prefix string) error
 }
 
-// PutCondition specifies a precondition for Put. At most one of IfMatch or
-// IfNoneMatch should be set.
+// BlobInfo describes an object in the store.
+type BlobInfo struct {
+	ETag         string
+	Size         int64
+	LastModified time.Time
+}
+
+// PutCondition specifies a precondition for Put. Only one of IfMatch or
+// IfNoneMatch may be set; setting both is an error.
 type PutCondition struct {
 	// IfMatch, if non-empty, requires the current ETag of the object to equal
 	// this value. Use this for compare-and-swap.

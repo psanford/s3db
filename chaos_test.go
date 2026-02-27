@@ -56,11 +56,11 @@ func (f *faultyStore) GetRange(ctx context.Context, key string, start, end int64
 	return f.inner.GetRange(ctx, key, start, end)
 }
 
-func (f *faultyStore) Head(ctx context.Context, key string) (string, error) {
+func (f *faultyStore) Stat(ctx context.Context, key string) (BlobInfo, error) {
 	if err := f.maybeFail(); err != nil {
-		return "", err
+		return BlobInfo{}, err
 	}
-	return f.inner.Head(ctx, key)
+	return f.inner.Stat(ctx, key)
 }
 
 func (f *faultyStore) Put(ctx context.Context, key string, body io.Reader, cond PutCondition) (string, error) {
@@ -272,7 +272,7 @@ func TestChaos_OrphansGetCleaned(t *testing.T) {
 	}
 
 	// Compact and GC through the CLEAN store (no injected failures).
-	cleanDB, _ := Open(ctx, inner, "mydb/")
+	cleanDB, _ := Open(ctx, inner, "mydb/", WithGCGracePeriod(0))
 	if err := cleanDB.Compact(ctx); err != nil {
 		t.Fatalf("Compact: %v", err)
 	}

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/psanford/s3db/internal/etag"
 )
@@ -15,8 +16,9 @@ import (
 // alongside the body (rather than recomputing on every access) mirrors S3's
 // behavior and makes CAS checks cheap.
 type memEntry struct {
-	body []byte
-	etag string
+	body    []byte
+	etag    string
+	modTime time.Time
 }
 
 // MemBlobStore is an in-memory BlobStore with real ETag-based CAS semantics.
@@ -73,23 +75,26 @@ func (m *MemBlobStore) GetRange(ctx context.Context, key string, start, end int6
 	return io.NopCloser(bytes.NewReader(e.body[start : end+1])), nil
 }
 
-func (m *MemBlobStore) Head(ctx context.Context, key string) (string, error) {
+func (m *MemBlobStore) Stat(ctx context.Context, key string) (BlobInfo, error) {
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return BlobInfo{}, err
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	e, ok := m.objects[key]
 	if !ok {
-		return "", ErrNotFound
+		return BlobInfo{}, ErrNotFound
 	}
-	return e.etag, nil
+	return BlobInfo{ETag: e.etag, Size: int64(len(e.body)), LastModified: e.modTime}, nil
 }
 
 func (m *MemBlobStore) Put(ctx context.Context, key string, body io.Reader, cond PutCondition) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
+	}
+	if cond.IfMatch != "" && cond.IfNoneMatch {
+		return "", errBothConditions
 	}
 
 	// Drain the reader before taking the lock. This mirrors S3 behavior
@@ -119,7 +124,7 @@ func (m *MemBlobStore) Put(ctx context.Context, key string, body io.Reader, cond
 	}
 
 	newETag := etag.Compute(stored)
-	m.objects[key] = memEntry{body: stored, etag: newETag}
+	m.objects[key] = memEntry{body: stored, etag: newETag, modTime: time.Now()}
 	return newETag, nil
 }
 

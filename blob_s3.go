@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -65,21 +66,32 @@ func (s *S3BlobStore) GetRange(ctx context.Context, key string, start, end int64
 	return out.Body, nil
 }
 
-func (s *S3BlobStore) Head(ctx context.Context, key string) (string, error) {
+func (s *S3BlobStore) Stat(ctx context.Context, key string) (BlobInfo, error) {
 	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
 		if isNotFound(err) {
-			return "", ErrNotFound
+			return BlobInfo{}, ErrNotFound
 		}
-		return "", err
+		return BlobInfo{}, err
 	}
-	return etag.Normalize(aws.ToString(out.ETag)), nil
+	var mod time.Time
+	if out.LastModified != nil {
+		mod = *out.LastModified
+	}
+	return BlobInfo{
+		ETag:         etag.Normalize(aws.ToString(out.ETag)),
+		Size:         aws.ToInt64(out.ContentLength),
+		LastModified: mod,
+	}, nil
 }
 
 func (s *S3BlobStore) Put(ctx context.Context, key string, body io.Reader, cond PutCondition) (string, error) {
+	if cond.IfMatch != "" && cond.IfNoneMatch {
+		return "", errBothConditions
+	}
 	in := &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
@@ -152,7 +164,7 @@ func (s *S3BlobStore) DeletePrefix(ctx context.Context, prefix string) error {
 		for j, k := range keys[i:end] {
 			objs[j] = types.ObjectIdentifier{Key: aws.String(k)}
 		}
-		_, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+		out, err := s.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(s.bucket),
 			Delete: &types.Delete{
 				Objects: objs,
@@ -161,6 +173,14 @@ func (s *S3BlobStore) DeletePrefix(ctx context.Context, prefix string) error {
 		})
 		if err != nil {
 			return err
+		}
+		// With Quiet: true, only per-object failures appear in Errors.
+		// Object lock, MFA-delete, or permission issues can cause
+		// individual keys to fail while the overall request succeeds.
+		if len(out.Errors) > 0 {
+			e := out.Errors[0]
+			return fmt.Errorf("delete %s: %s: %s (%d keys failed)",
+				aws.ToString(e.Key), aws.ToString(e.Code), aws.ToString(e.Message), len(out.Errors))
 		}
 	}
 	return nil

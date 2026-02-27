@@ -24,7 +24,7 @@ var (
 	// of the migrations this client knows about. Upgrade your code.
 	ErrSchemaTooNew = errors.New("s3db: database schema is newer than this client supports")
 
-	// ErrNotInitialized is returned when Open finds no manifest and
-	// auto-initialization is disabled.
-	ErrNotInitialized = errors.New("s3db: database not initialized (no manifest)")
+	// errBothConditions is returned when PutCondition has both IfMatch
+	// and IfNoneMatch set.
+	errBothConditions = errors.New("s3db: PutCondition: both IfMatch and IfNoneMatch set")
 )

@@ -47,9 +47,9 @@ func TestMemBlobStore_GetNotFound(t *testing.T) {
 	}
 }
 
-func TestMemBlobStore_HeadNotFound(t *testing.T) {
+func TestMemBlobStore_StatNotFound(t *testing.T) {
 	s := NewMemBlobStore()
-	_, err := s.Head(context.Background(), "missing")
+	_, err := s.Stat(context.Background(), "missing")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -72,17 +72,23 @@ func TestMemBlobStore_PutGet(t *testing.T) {
 	}
 }
 
-func TestMemBlobStore_HeadMatchesGet(t *testing.T) {
+func TestMemBlobStore_StatMatchesGet(t *testing.T) {
 	s := NewMemBlobStore()
 
 	putETag := putString(t, s, "k", "hello", NoCondition)
 
-	headETag, err := s.Head(context.Background(), "k")
+	info, err := s.Stat(context.Background(), "k")
 	if err != nil {
-		t.Fatalf("Head: %v", err)
+		t.Fatalf("Stat: %v", err)
 	}
-	if headETag != putETag {
-		t.Errorf("Head etag = %q, want %q", headETag, putETag)
+	if info.ETag != putETag {
+		t.Errorf("Stat etag = %q, want %q", info.ETag, putETag)
+	}
+	if info.Size != int64(len("hello")) {
+		t.Errorf("Stat size = %d, want %d", info.Size, len("hello"))
+	}
+	if info.LastModified.IsZero() {
+		t.Error("Stat LastModified is zero")
 	}
 }
 
@@ -347,8 +353,8 @@ func TestMemBlobStore_ContextCancel(t *testing.T) {
 	if _, _, err := s.Get(ctx, "k"); !errors.Is(err, context.Canceled) {
 		t.Errorf("Get: expected context.Canceled, got %v", err)
 	}
-	if _, err := s.Head(ctx, "k"); !errors.Is(err, context.Canceled) {
-		t.Errorf("Head: expected context.Canceled, got %v", err)
+	if _, err := s.Stat(ctx, "k"); !errors.Is(err, context.Canceled) {
+		t.Errorf("Stat: expected context.Canceled, got %v", err)
 	}
 	if _, err := s.Put(ctx, "k", strings.NewReader(""), NoCondition); !errors.Is(err, context.Canceled) {
 		t.Errorf("Put: expected context.Canceled, got %v", err)

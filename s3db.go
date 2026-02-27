@@ -208,11 +208,13 @@ func bootstrap(ctx context.Context, store BlobStore, prefix, manifestKey string)
 	return m, etag, nil
 }
 
-// View runs fn against the current database state. It first syncs the local
-// DB to the latest manifest, then invokes fn. fn should only perform reads;
-// any writes it makes are local-only and will NOT be committed or rolled
-// back (they'll be visible to subsequent View/Update calls on the same DB
-// instance until the next sync). Don't write in View.
+// View runs fn against the current database state, inside a read-only
+// transaction. It first syncs the local DB to the latest manifest, then
+// invokes fn inside BEGIN/ROLLBACK. Any writes fn performs are discarded
+// when View returns — use Update for writes.
+//
+// The ctx's Done channel is plumbed to SQLite via SetInterrupt, so
+// long-running queries will be interrupted if ctx is cancelled.
 //
 // View holds the DB mutex for its entire duration, serializing with other
 // View and Update calls on the same DB instance.
@@ -223,7 +225,20 @@ func (db *DB) View(ctx context.Context, fn func(*sqlite.Conn) error) error {
 	if err := refreshManifest(ctx, &db.cfg, &db.st, db.localPath); err != nil {
 		return err
 	}
-	return fn(db.st.conn)
+
+	return db.withInterrupt(ctx, func() error {
+		// Wrap fn in a transaction that is always rolled back. This
+		// discards any writes fn makes (enforcing the read-only contract)
+		// while still letting fn see a consistent snapshot.
+		if err := sqlitex.Execute(db.st.conn, "BEGIN", nil); err != nil {
+			return err
+		}
+		fnErr := fn(db.st.conn)
+		if err := sqlitex.Execute(db.st.conn, "ROLLBACK", nil); err != nil && fnErr == nil {
+			return err
+		}
+		return fnErr
+	})
 }
 
 // Update runs fn as a transaction against the current database state, then
@@ -249,16 +264,20 @@ func (db *DB) Update(ctx context.Context, fn func(*sqlite.Conn) error) error {
 		return err
 	}
 
-	if err := doUpdate(ctx, &db.cfg, &db.st, db.localPath, fn); err != nil {
+	if err := db.withInterrupt(ctx, func() error {
+		return doUpdate(ctx, &db.cfg, &db.st, db.localPath, fn)
+	}); err != nil {
 		return err
 	}
 
 	// Auto-compact hook. Runs synchronously in the lock — simple and
 	// correct, and compaction of a small DB is fast. Compaction errors
-	// are swallowed: the Update succeeded, and compaction can be retried
-	// later (by the next Update, or an explicit Compact call).
+	// are reported via the optional handler but don't fail the Update
+	// (the write has already committed).
 	if db.opts.autoCompactAfter > 0 && len(db.st.manifest.Log) >= db.opts.autoCompactAfter {
-		_ = db.compactLocked(ctx)
+		if cerr := db.compactLocked(ctx); cerr != nil && db.opts.onCompactError != nil {
+			db.opts.onCompactError(cerr)
+		}
 	}
 
 	return nil
@@ -340,4 +359,20 @@ func (db *DB) Seq() int64 {
 // DELETE journal mode (the SQLite default) keeps everything in one file.
 func openLocalConn(path string) (*sqlite.Conn, error) {
 	return sqlite.OpenConn(path, sqlite.OpenReadWrite)
+}
+
+// withInterrupt plumbs ctx cancellation to the SQLite connection for the
+// duration of fn. SetInterrupt is reset on whatever conn is current when
+// fn returns — not the one that was current at entry — because fn may
+// have replaced st.conn via a full-refresh (close+download+reopen). This
+// matters: calling SetInterrupt on a closed conn panics.
+//
+// If fn itself replaces conn mid-execution (e.g. during a full refresh in
+// doUpdate), the new conn will NOT have interrupt set until the next call.
+// This is acceptable: the window is brief and the network operations
+// during refresh honour ctx independently.
+func (db *DB) withInterrupt(ctx context.Context, fn func() error) error {
+	db.st.conn.SetInterrupt(ctx.Done())
+	defer func() { db.st.conn.SetInterrupt(nil) }()
+	return fn()
 }

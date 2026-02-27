@@ -96,8 +96,8 @@ func TestCompact_PreservesSchemaVersion(t *testing.T) {
 	// Manually bump schema version (simulating a past migration).
 	db.st.manifest.SchemaVersion = 7
 	db.cfg.schemaVer = 7
-	putManifest(ctx, store, "mydb/manifest.json", db.st.manifest, PutCondition{IfMatch: db.st.etag})
-	db.st.etag, _ = store.Head(ctx, "mydb/manifest.json")
+	newEtag, _ := putManifest(ctx, store, "mydb/manifest.json", db.st.manifest, PutCondition{IfMatch: db.st.etag})
+	db.st.etag = newEtag
 
 	// Write + compact.
 	db.Update(ctx, func(c *sqlite.Conn) error {
@@ -246,7 +246,7 @@ func TestAutoCompact(t *testing.T) {
 func TestGC_DeletesOldEpoch(t *testing.T) {
 	store := NewMemBlobStore()
 	ctx := context.Background()
-	db := openWithSchema(t, store, "mydb/")
+	db := openWithSchema(t, store, "mydb/", WithGCGracePeriod(0))
 	defer db.Close()
 
 	// Write, compact, write again. Old epoch should now be garbage.
@@ -323,7 +323,7 @@ func TestGC_CleansOrphans(t *testing.T) {
 	// Simulate a crashed writer: blob uploaded, manifest never CAS'd.
 	store := NewMemBlobStore()
 	ctx := context.Background()
-	db := openWithSchema(t, store, "mydb/")
+	db := openWithSchema(t, store, "mydb/", WithGCGracePeriod(0))
 	defer db.Close()
 
 	// Commit one real changeset so the epoch exists.
