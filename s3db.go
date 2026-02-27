@@ -114,11 +114,19 @@ func Open(ctx context.Context, store BlobStore, prefix string, opts ...Option) (
 		return nil, err
 	}
 
-	// Determine expected schema version from migrations.
+	// Determine expected schema version. Normally this comes from the
+	// migrations list; with WithSchemaUnchecked (admin mode), we adopt
+	// whatever the manifest says so runMigrations and refreshManifest
+	// see a match and don't reject. Compact/GC/Stats don't touch user
+	// tables, so operating without understanding the schema is safe.
 	schemaVer := 0
-	for _, mig := range o.migrations {
-		if mig.Version > schemaVer {
-			schemaVer = mig.Version
+	if o.schemaUnchecked {
+		schemaVer = m.SchemaVersion
+	} else {
+		for _, mig := range o.migrations {
+			if mig.Version > schemaVer {
+				schemaVer = mig.Version
+			}
 		}
 	}
 
@@ -146,9 +154,14 @@ func Open(ctx context.Context, store BlobStore, prefix string, opts ...Option) (
 	// the Up function runs on the local DB, the result becomes a new
 	// snapshot, and the manifest CAS bumps schema_version. Safe under
 	// concurrent Open: the CAS loser sees the bumped version and skips.
-	if err := db.runMigrations(ctx); err != nil {
-		db.Close()
-		return nil, err
+	// Skipped entirely in schemaUnchecked mode (no migrations to run,
+	// and the schema-version check inside runMigrations would otherwise
+	// fire even when we've adopted the manifest's version).
+	if !o.schemaUnchecked {
+		if err := db.runMigrations(ctx); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 
 	return db, nil

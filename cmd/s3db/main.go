@@ -213,7 +213,7 @@ func cmdStatus(args []string) error {
 	ctx := context.Background()
 	store := newStore(*bucket)
 
-	db, err := s3db.Open(ctx, store, *prefix)
+	db, err := s3db.Open(ctx, store, *prefix, s3db.WithSchemaUnchecked())
 	if err != nil {
 		return err
 	}
@@ -244,7 +244,7 @@ func cmdCompact(args []string) error {
 	ctx := context.Background()
 	store := newStore(*bucket)
 
-	db, err := s3db.Open(ctx, store, *prefix)
+	db, err := s3db.Open(ctx, store, *prefix, s3db.WithSchemaUnchecked())
 	if err != nil {
 		return err
 	}
@@ -268,7 +268,7 @@ func cmdGC(args []string) error {
 	fs := flag.NewFlagSet("gc", flag.ExitOnError)
 	bucket := fs.String("bucket", "", "S3 bucket name (required)")
 	prefix := fs.String("prefix", "", "key prefix ending in / (required)")
-	grace := fs.Duration("grace", 0, "grace period for snapshot deletion (0 = use library default of 5m)")
+	grace := fs.Duration("grace", -1, "grace period for snapshot deletion (-1 = library default of 5m, 0 = disabled)")
 	fs.Parse(args)
 
 	if *bucket == "" || *prefix == "" {
@@ -279,8 +279,8 @@ func cmdGC(args []string) error {
 	ctx := context.Background()
 	store := newStore(*bucket)
 
-	var opts []s3db.Option
-	if *grace != 0 {
+	opts := []s3db.Option{s3db.WithSchemaUnchecked()}
+	if *grace >= 0 {
 		opts = append(opts, s3db.WithGCGracePeriod(*grace))
 	}
 

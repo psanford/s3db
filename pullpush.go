@@ -2,6 +2,7 @@ package s3db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -114,7 +115,7 @@ func Push(ctx context.Context, store BlobStore, prefix, srcPath string, expected
 	// CAS the manifest: new snapshot, empty log, seq and schema unchanged.
 	newManifest := m.withSnapshot(blobRef{Key: snapKey, Seq: m.Seq, Size: snapSize})
 	if _, err := putManifest(ctx, store, manifestKey, newManifest, PutCondition{IfMatch: etag}); err != nil {
-		if err == ErrPreconditionFailed {
+		if errors.Is(err, ErrPreconditionFailed) {
 			// Someone committed between our loadManifest and CAS. This
 			// is the same race that expectedSeq guards against, but
 			// happening in the CAS window rather than the pull→push

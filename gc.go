@@ -44,47 +44,56 @@ func (db *DB) GC(ctx context.Context) error {
 	grace := db.opts.gcGracePeriod
 	now := time.Now()
 
+	// Grace period check: epochs only become garbage via compaction, which
+	// swaps the snapshot. So the age of the CURRENT snapshot = time since
+	// the most recent compaction = lower bound on how long anything has
+	// been garbage. If the snapshot is younger than grace, skip the epoch
+	// sweep entirely — a reader may still be holding a pre-compaction
+	// manifest pointing at changesets we'd otherwise delete.
+	//
+	// (Checking the changeset's OWN age is wrong: a changeset uploaded
+	// 10 minutes ago may have become garbage only 30 seconds ago.)
+	sweepEpochs := true
+	if grace > 0 {
+		info, serr := db.cfg.store.Stat(ctx, m.Snapshot.Key)
+		if serr != nil || now.Sub(info.LastModified) < grace {
+			sweepEpochs = false
+		}
+	}
+
 	// Sweep changeset epochs. List all keys under changesets/, group by
 	// epoch prefix, delete any epoch that (a) is not the current epoch
 	// and (b) has no keys in the live set.
-	csPrefix := db.cfg.prefix + "changesets/"
-	keys, err := db.cfg.store.List(ctx, csPrefix)
-	if err != nil {
-		return fmt.Errorf("gc: list changesets: %w", err)
-	}
+	if sweepEpochs {
+		csPrefix := db.cfg.prefix + "changesets/"
+		keys, err := db.cfg.store.List(ctx, csPrefix)
+		if err != nil {
+			return fmt.Errorf("gc: list changesets: %w", err)
+		}
 
-	epochs := groupByEpoch(keys, csPrefix)
-	for epoch, epochKeys := range epochs {
-		if epoch == currentEpoch {
-			// Never delete the current epoch — it may receive writes
-			// after our manifest snapshot.
-			continue
-		}
-		// Check if any key in this epoch is live.
-		hasLive := false
-		for _, k := range epochKeys {
-			if _, ok := liveChangesets[k]; ok {
-				hasLive = true
-				break
+		epochs := groupByEpoch(keys, csPrefix)
+		for epoch, epochKeys := range epochs {
+			if epoch == currentEpoch {
+				// Never delete the current epoch — it may receive writes
+				// after our manifest snapshot.
+				continue
 			}
-		}
-		if hasLive {
-			continue
-		}
-		// Entire epoch is unreferenced. Check grace period before
-		// deleting — a reader who loaded an old manifest (pointing at
-		// these changesets) may still be fetching them. Stat the first
-		// key as a representative; changesets in an epoch are uploaded
-		// within seconds of each other, so one age check suffices.
-		if grace > 0 && len(epochKeys) > 0 {
-			info, serr := db.cfg.store.Stat(ctx, epochKeys[0])
-			if serr != nil || now.Sub(info.LastModified) < grace {
-				continue // can't stat, or too young
+			// Check if any key in this epoch is live.
+			hasLive := false
+			for _, k := range epochKeys {
+				if _, ok := liveChangesets[k]; ok {
+					hasLive = true
+					break
+				}
 			}
-		}
-		epochPrefix := csPrefix + epoch + "/"
-		if err := db.cfg.store.DeletePrefix(ctx, epochPrefix); err != nil {
-			return fmt.Errorf("gc: delete epoch %s: %w", epoch, err)
+			if hasLive {
+				continue
+			}
+			// Entire epoch is garbage.
+			epochPrefix := csPrefix + epoch + "/"
+			if err := db.cfg.store.DeletePrefix(ctx, epochPrefix); err != nil {
+				return fmt.Errorf("gc: delete epoch %s: %w", epoch, err)
+			}
 		}
 	}
 

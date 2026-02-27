@@ -12,6 +12,7 @@ type options struct {
 	migrations       []Migration
 	gcGracePeriod    time.Duration
 	onCompactError   func(error)
+	schemaUnchecked  bool
 }
 
 func defaultOptions() options {
@@ -87,4 +88,23 @@ func WithGCGracePeriod(d time.Duration) Option {
 // schema version doesn't match.
 func WithMigrations(ms []Migration) Option {
 	return func(o *options) { o.migrations = ms }
+}
+
+// WithSchemaUnchecked makes Open adopt whatever schema_version the manifest
+// has, rather than requiring it to match the provided migrations. Normally
+// Open returns ErrSchemaTooNew if the database is ahead of your migrations,
+// to prevent operating on a schema you don't understand.
+//
+// Intended for ADMIN operations (Compact, GC, Stats) that don't touch user
+// tables. These are schema-agnostic — VACUUM doesn't care about table
+// layout, GC only looks at blob keys, Stats reads the manifest. The CLI
+// tool uses this option for exactly these commands.
+//
+// Do NOT use this for regular application code. View and Update WILL work
+// (schema is adopted, not rejected), but your code is operating on tables
+// whose layout you don't know. If a concurrent migrator bumps the schema
+// AFTER your Open, subsequent operations will return ErrSchemaTooNew —
+// the adopted version is frozen at Open time.
+func WithSchemaUnchecked() Option {
+	return func(o *options) { o.schemaUnchecked = true }
 }

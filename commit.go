@@ -46,16 +46,25 @@ type commitConfig struct {
 func syncToManifest(ctx context.Context, cfg *commitConfig, st *commitState, localPath string) error {
 	m := st.manifest
 
-	needRefresh := st.localSeq < m.Snapshot.Seq || st.snapshotKey != m.Snapshot.Key
+	// st.conn may be nil here if a previous refresh attempt failed after
+	// Close but before reopen — treat that as needing refresh too (there's
+	// no conn to incrementally sync). This makes the DB self-healing: a
+	// transient download failure followed by a successful retry recovers
+	// without requiring the caller to Close+re-Open.
+	needRefresh := st.conn == nil ||
+		st.localSeq < m.Snapshot.Seq ||
+		st.snapshotKey != m.Snapshot.Key
 	if needRefresh {
-		if err := st.conn.Close(); err != nil {
-			return fmt.Errorf("sync: close for refresh: %w", err)
+		if st.conn != nil {
+			if err := st.conn.Close(); err != nil {
+				return fmt.Errorf("sync: close for refresh: %w", err)
+			}
+			// Nil immediately. If download/reopen fails below, st.conn
+			// must not point at a closed connection — callers (e.g.
+			// withInterrupt's defer) may call methods that panic on
+			// closed conns. Nil is explicitly checked.
+			st.conn = nil
 		}
-		// Nil out the closed conn immediately. If download or reopen
-		// fails below, st.conn must NOT point at a closed connection —
-		// callers (e.g. withInterrupt's defer) may call methods on it
-		// that panic on closed conns. A nil conn is explicitly checked.
-		st.conn = nil
 		if err := downloadSnapshot(ctx, cfg.store, m.Snapshot.Key, m.Snapshot.Size, localPath); err != nil {
 			return err
 		}

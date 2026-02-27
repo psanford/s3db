@@ -255,3 +255,203 @@ AWS "equal jitter" variant (range `[base/2, 1.5·base)`). Full jitter is
 **Only #23 needs immediate attention** — it turns a recoverable network error
 into an unrecoverable panic under a realistic concurrency pattern (concurrent
 compaction + transient download failure).
+
+---
+
+# Third Review: After b66911c + 43c0258 (2026-02-27)
+
+Two commits since the last review:
+- **b66911c** — fixes for #23–#26
+- **43c0258** — new `Pull`/`Push` API + `cmd/s3db` CLI tool
+
+All tests pass, including race detector. Build is clean, `go vet` clean.
+
+## Verification of Re-Review Fixes
+
+| # | Issue | Status | Notes |
+|---|---|---|---|
+| 23 | `withInterrupt` panic | **Fixed** | `st.conn = nil` after Close (`commit.go:58`); nil-check in defer (`s3db.go:380`). `TestUpdate_RefreshFailureDoesNotPanic` is a thorough regression test — sets up compaction on db2, swaps db1's store to fail snapshot downloads, wraps in `recover()` to catch panic as test failure. |
+| 24 | GC grace on changesets | **Fixed** (minor semantic quirk) | Epoch deletion now `Stat`s first key, skips if younger than grace. See note #31 below. |
+| 25 | Migration first-attempt download | **Fixed correctly** | `lastAttemptedVer` tracking. `forceRefresh` only true when same migration version is retried (writer interference); concurrent-migrator case handled naturally by snapshot-key change. Traced both paths — correct. |
+| 26 | Orphan on ErrConflict | **Fixed** | Best-effort delete before returning `ErrConflict` (`commit.go:275-277`). |
+
+## New Issues
+
+### 30. DB is stuck (not panicked) after a failed refresh
+
+**Severity**: Medium
+**Location**: `commit.go:51`
+
+The #23 fix prevents the panic but leaves the DB in an unrecoverable-without-reopen
+state. After `syncToManifest` fails mid-refresh (`st.conn = nil`), the NEXT
+`Update`/`View` call hits `syncToManifest` again, tries `st.conn.Close()` on
+nil, and zombiezen returns the error `"sqlite: close: nil connection"`
+(verified — zombiezen nil-checks in Close, no panic). Every subsequent call
+returns the same error until `Close()` + re-`Open()`.
+
+**Strictly better than before** (error vs. panic), but not self-healing. A
+3-line fix would make it recover automatically:
+
+```go
+// commit.go:50-53
+if needRefresh {
+    if st.conn != nil {
+        if err := st.conn.Close(); err != nil { ... }
+        st.conn = nil
+    }
+    // ...download, reopen as before
+}
+```
+
+With this, a failed refresh followed by a successful retry (e.g. transient
+network error clears) would fully recover the DB. As-is, the caller must
+know to Close+reopen on this specific error.
+
+**Not urgent** — the behavior is documented-ish (`TestUpdate_RefreshFailureDoesNotPanic`
+shows Close works after), but the recovery path isn't documented in godoc.
+
+### 31. GC changeset grace check uses upload time, not garbage time
+
+**Severity**: Low
+**Location**: `gc.go:80`
+
+The fix for #24 `Stat`s `epochKeys[0]` (lexicographically first key) and uses
+its `LastModified` as a proxy for "how long has this epoch been garbage". But
+the key's upload time is NOT when the epoch became garbage — it's when that
+specific changeset was uploaded, which could be arbitrarily earlier (before
+compaction).
+
+**Scenario**:
+1. Changeset `cs-aaa` uploaded at T-10min (was live in the log)
+2. Compaction at T-30s (cs-aaa subsumed, epoch becomes garbage)
+3. Reader loaded old manifest at T-20s, will fetch cs-aaa at T+10s
+4. GC at T: `Stat(cs-aaa)` → age = 10min > grace (5min) → DELETE
+5. Reader at T+10s: 404
+
+The grace check intended to protect readers with a 30s-old manifest, but the
+age check sees 10 minutes. The RIGHT thing to check is the **current snapshot's**
+age (= time since compaction), not the old changeset's age.
+
+**Suggested fix**: at the top of GC, `Stat(m.Snapshot.Key)`. If the snapshot
+is younger than `grace`, skip the ENTIRE epoch-sweep (epochs only become
+garbage via compaction; recent compaction = all garbage is recent). One
+`Stat` call per GC, not one per epoch.
+
+**Why it's only Low severity**: the current code is strictly safer than
+no-grace (never deletes anything it shouldn't prematurely on the writer side;
+may occasionally delete something a slow reader wants). The window is small
+and readers fail fast with a clear error. This is a refinement, not a fix.
+
+### 32. CLI `status`/`compact`/`gc` fail on migrated databases
+
+**Severity**: Medium (usability, not correctness)
+**Location**: `cmd/s3db/main.go:216,247,287`
+
+All three commands call `s3db.Open(ctx, store, prefix)` with no
+`WithMigrations` option. `Open` always runs `runMigrations`, which sees
+`maxVer=0 < manifest.SchemaVersion` and returns `ErrSchemaTooNew`.
+
+**Verified**:
+```
+Open (no migrations) on v1 DB:
+  s3db: database schema is newer than this client supports:
+  database at schema v1, client knows up to v0
+```
+
+Result: the CLI cannot status/compact/gc any database that has ever run
+a migration — which is every real-world database. `Pull` and `Push` use
+the raw manifest API directly and are unaffected.
+
+**Fix options**:
+- **a)** Add a `WithSkipSchemaCheck` option for admin operations (risky —
+  Compact runs VACUUM on a schema the CLI doesn't understand, which is fine
+  since VACUUM is schema-agnostic, but philosophically unclean)
+- **b)** Have the CLI peek the manifest's `SchemaVersion` first and pass a
+  stub `WithMigrations([]Migration{{Version: N, Up: noop}})` to satisfy the
+  check (hacky, breaks on gaps)
+- **c)** Refactor Compact/GC into top-level functions (like Pull/Push) that
+  don't need a `*DB` and don't check schema (cleanest)
+
+### 33. CLI `-grace 0` means "library default", not "zero"
+
+**Severity**: Low
+**Location**: `cmd/s3db/main.go:283`
+
+```go
+if *grace != 0 {
+    opts = append(opts, s3db.WithGCGracePeriod(*grace))
+}
+```
+
+There's no way to explicitly set grace=0 from the CLI. `-grace 0` is
+indistinguishable from not passing the flag. Minor UX papercut — could
+use a sentinel default like `-1` meaning "library default", or `flag.Visit`
+to check if the flag was actually set.
+
+### 34. `Push` uses `==` instead of `errors.Is`
+
+**Severity**: Low
+**Location**: `pullpush.go:117`
+
+```go
+if err == ErrPreconditionFailed {
+```
+
+Every other call site in the codebase uses `errors.Is(err, ErrPreconditionFailed)`.
+Not a bug today (both `S3BlobStore.Put` and `MemBlobStore.Put` return the
+sentinel directly), but brittle against future wrapping.
+
+### 35. `s3db.go` missing trailing newline
+
+**Severity**: Trivial
+**Location**: `s3db.go:385` (end of file)
+
+`git diff` shows `\ No newline at end of file`. Some linters will flag.
+
+## New Feature Assessment: Pull/Push
+
+`Pull` and `Push` are clean, well-tested, and correct. Push's safety
+properties under concurrency are solid:
+
+- **Concurrent Update during Push**: Push's manifest CAS changes the ETag;
+  the concurrent Update gets 412, re-syncs, sees the new `snapshot.key`,
+  does a full refresh → picks up the pushed state. Verified by tracing
+  `syncToManifest` — the `snapshotKey != m.Snapshot.Key` check catches it.
+
+- **Concurrent Update before Push**: Push's `expectedSeq` check fails with
+  `ErrSeqMismatch`. `TestPush_SeqMismatch` covers this.
+
+- **CAS window race**: `expectedSeq` passes but CAS fails (someone committed
+  in the load→put window). Push translates 412 → `ErrSeqMismatch` for
+  consistent error handling. `TestPush_ConcurrentCAS` covers this with
+  `pushInterposingStore`.
+
+- **Force push**: Documented as dangerous; `TestPush_Force` honestly
+  demonstrates that concurrent writes are lost. Good.
+
+- **SQLite validation**: `PRAGMA quick_check` before upload. Catches
+  non-SQLite files and corruption. `TestPush_ValidatesSQLite` covers.
+
+- **Schema preservation**: `withSnapshot` preserves `SchemaVersion`.
+  `TestPush_PreservesSchemaVersion` covers.
+
+The `.seq` sidecar file is a nice workflow touch.
+
+## Summary
+
+| # | Issue | Severity | Status |
+|---|---|---|---|
+| 23 | withInterrupt panic | — | **Fixed** |
+| 24 | GC grace on changesets | — | **Fixed** |
+| 25 | Migration first-attempt download | — | **Fixed** |
+| 26 | Orphan on ErrConflict | — | **Fixed** |
+| 30 | DB stuck after failed refresh (error, not panic) | Medium | Self-heal would be 3-line fix |
+| 31 | GC changeset grace uses upload time | Low | Safer fix: check snapshot age |
+| 32 | CLI status/compact/gc fail on migrated DBs | Medium | Real usability bug |
+| 33 | CLI `-grace 0` = default | Low | UX papercut |
+| 34 | Push uses `==` not `errors.Is` | Low | Style consistency |
+| 35 | Missing trailing newline | Trivial | — |
+
+**No new panics, no correctness bugs.** The two Medium items are #30 (quality
+of life — DB should self-heal after transient download failure) and #32
+(CLI unusable on any migrated DB — real blocker for the CLI's utility).

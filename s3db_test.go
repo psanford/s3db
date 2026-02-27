@@ -738,9 +738,26 @@ func TestUpdate_RefreshFailureDoesNotPanic(t *testing.T) {
 	}
 	t.Logf("Update returned error cleanly: %v", err)
 
-	// db1's conn should be nil (failed refresh). Close should not panic.
-	if err := db1.Close(); err != nil {
-		t.Logf("Close returned: %v", err) // not necessarily an error
+	// db1's conn is now nil (failed refresh). Verify self-healing: turn
+	// off the failure injection and try again — the DB should recover
+	// automatically without requiring Close+re-Open.
+	db1.cfg.store = inner
+	err = db1.Update(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO users (id, name) VALUES (3, 'recovered')`, nil)
+	})
+	if err != nil {
+		t.Fatalf("Update after transient failure should self-heal, got: %v", err)
+	}
+
+	// Verify the write landed.
+	var name string
+	db1.View(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT name FROM users WHERE id = 3`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { name = s.ColumnText(0); return nil },
+		})
+	})
+	if name != "recovered" {
+		t.Errorf("name = %q, want 'recovered' (self-heal write not visible)", name)
 	}
 }
 
@@ -858,5 +875,89 @@ func TestWithMaxRetries_ClampsToOne(t *testing.T) {
 	})
 	if err != nil {
 		t.Errorf("Update with WithMaxRetries(0) failed: %v", err)
+	}
+}
+
+func TestWithSchemaUnchecked(t *testing.T) {
+	// Admin operations (Compact, GC, Stats) should work on migrated DBs
+	// even without knowing the migrations. This is what the CLI needs.
+	store := NewMemBlobStore()
+	ctx := context.Background()
+
+	// Bring DB to schema v3 using migrations.
+	migs := []Migration{
+		{Version: 1, Up: func(c *sqlite.Conn) error {
+			return sqlitex.ExecuteScript(c, `CREATE TABLE t (id INTEGER PRIMARY KEY);`, nil)
+		}},
+		{Version: 2, Up: func(c *sqlite.Conn) error {
+			return sqlitex.ExecuteScript(c, `CREATE TABLE u (id INTEGER PRIMARY KEY);`, nil)
+		}},
+		{Version: 3, Up: func(c *sqlite.Conn) error {
+			return sqlitex.ExecuteScript(c, `CREATE TABLE v (id INTEGER PRIMARY KEY);`, nil)
+		}},
+	}
+	setup, err := Open(ctx, store, "mydb/", WithMigrations(migs))
+	if err != nil {
+		t.Fatalf("setup Open: %v", err)
+	}
+	// Write something so Compact has work to do.
+	setup.Update(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `INSERT INTO t (id) VALUES (1)`, nil)
+	})
+	setup.Close()
+
+	// Without WithSchemaUnchecked, Open with no migrations should fail.
+	_, err = Open(ctx, store, "mydb/")
+	if !errors.Is(err, ErrSchemaTooNew) {
+		t.Fatalf("Open without migrations on v3 DB: expected ErrSchemaTooNew, got %v", err)
+	}
+
+	// With WithSchemaUnchecked, Open should succeed.
+	db, err := Open(ctx, store, "mydb/", WithSchemaUnchecked(), WithGCGracePeriod(0))
+	if err != nil {
+		t.Fatalf("Open WithSchemaUnchecked: %v", err)
+	}
+	defer db.Close()
+
+	// Stats should work.
+	s := db.Stats()
+	if s.SchemaVersion != 3 {
+		t.Errorf("SchemaVersion = %d, want 3", s.SchemaVersion)
+	}
+	if s.LogEntries != 1 {
+		t.Errorf("LogEntries = %d, want 1", s.LogEntries)
+	}
+
+	// Compact should work (schema-agnostic).
+	if err := db.Compact(ctx); err != nil {
+		t.Errorf("Compact: %v", err)
+	}
+	if db.Stats().LogEntries != 0 {
+		t.Error("log not cleared after compact")
+	}
+
+	// GC should work.
+	if err := db.GC(ctx); err != nil {
+		t.Errorf("GC: %v", err)
+	}
+
+	// View/Update should still be blocked by the runtime schema check
+	// (schemaUnchecked adopts the manifest's version for Open's preflight,
+	// but refreshManifest's check is independent and still requires a match).
+	// Actually no — we set cfg.schemaVer = m.SchemaVersion, so the runtime
+	// check passes too. That's intentional: the CLI might want to View
+	// for diagnostics. The "don't use this for app code" guidance in the
+	// docstring is about knowing what you're doing, not about enforcement.
+	var count int64
+	err = db.View(ctx, func(c *sqlite.Conn) error {
+		return sqlitex.Execute(c, `SELECT COUNT(*) FROM t`, &sqlitex.ExecOptions{
+			ResultFunc: func(s *sqlite.Stmt) error { count = s.ColumnInt64(0); return nil },
+		})
+	})
+	if err != nil {
+		t.Errorf("View with schemaUnchecked: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("count = %d, want 1", count)
 	}
 }
