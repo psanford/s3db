@@ -145,7 +145,3 @@ S3DB_TEST_BUCKET=my-bucket go test -tags integration ./...
 
 - **S3 conditional writes** — `If-Match` and `If-None-Match` on `PutObject`. Generally available since late 2024. MinIO, Cloudflare R2, and most S3-compatible stores support it.
 - **Tables must have explicit PRIMARY KEYs** — the SQLite session extension requires it. Rowid-only tables won't replicate.
-
-## License
-
-TBD
