@@ -22,7 +22,6 @@ We then store a small json manifest file. This file points to the current base s
 
 Clients can cache the sqlite db locally, either in memory or to disk.
 
-
 ## Some more implementation details
 
 Because we are using the sqlite session extension, we need to use a sqlite driver that supports it. That also means we can't just use a plain database/sql API, because we need to handle writes failing from a write conflict. The API is pretty straight forward, it is just a little different:
@@ -111,6 +110,79 @@ func main() {
     })
 }
 ```
+
+### What this looks like in S3
+
+Say we open a database at `s3://my-bucket/mydb/`. Right after init, S3 has one snapshot and an empty changeset log:
+
+```
+mydb/
+├── manifest.json
+└── snapshots/
+    └── snap-a1b2c3d4.sqlite
+```
+
+```json
+{
+  "format_version": 1,
+  "seq": 0,
+  "schema_version": 1,
+  "snapshot": { "key": "mydb/snapshots/snap-a1b2c3d4.sqlite", "seq": 0 },
+  "log": []
+}
+```
+
+Now we do a few writes. Each `Update` uploads one changeset blob, then CAS-updates `manifest.json` to append a log entry and bump `seq`:
+
+```
+mydb/
+├── manifest.json
+├── snapshots/
+│   └── snap-a1b2c3d4.sqlite
+└── changesets/
+    └── snap-a1b2c3d4/
+        ├── cs-1111.bin
+        ├── cs-2222.bin
+        ├── cs-3333.bin
+        └── cs-4444.bin
+```
+
+```json
+{
+  "format_version": 1,
+  "seq": 4,
+  "schema_version": 1,
+  "snapshot": { "key": "mydb/snapshots/snap-a1b2c3d4.sqlite", "seq": 0 },
+  "log": [
+    { "key": "mydb/changesets/snap-a1b2c3d4/cs-1111.bin", "seq": 1 },
+    { "key": "mydb/changesets/snap-a1b2c3d4/cs-2222.bin", "seq": 2 },
+    { "key": "mydb/changesets/snap-a1b2c3d4/cs-3333.bin", "seq": 3 },
+    { "key": "mydb/changesets/snap-a1b2c3d4/cs-4444.bin", "seq": 4 }
+  ]
+}
+```
+
+To open the database, a reader fetches `manifest.json`, downloads the snapshot once, then applies the four changesets in order. On warm reopens, only newly-appended changesets need to be fetched.
+
+Eventually we compact. A new snapshot is built that already includes all the changesets, then the manifest is CAS'd to point at it with an empty log. The old snapshot and old changesets are now unreachable; GC will sweep them out:
+
+```
+mydb/
+├── manifest.json
+└── snapshots/
+    └── snap-b5e6f7a8.sqlite   ← new, rolls in everything up to seq 4
+```
+
+```json
+{
+  "format_version": 1,
+  "seq": 4,
+  "schema_version": 1,
+  "snapshot": { "key": "mydb/snapshots/snap-b5e6f7a8.sqlite", "seq": 4 },
+  "log": []
+}
+```
+
 
 ## Lambda deployment
 
