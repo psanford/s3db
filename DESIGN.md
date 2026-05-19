@@ -1,24 +1,6 @@
 # S3-Backed SQLite Database for Lambda
 
-## Problem
-
-We need a relational database usable from AWS Lambda functions with the following properties:
-
-- **Inexpensive** — no always-on costs (rules out RDS/Aurora); pay only for storage and requests
-- **Safe** — no data corruption under any failure mode
-- **Concurrency-safe** — multiple Lambda invocations can read and write concurrently without lost updates or corruption
-- **Good for small datasets** — target is databases in the KB–low-MB range, not GB-scale
-
-S3 is the storage backbone because it's durable, cheap, and has no idle cost. The challenge is that S3 has no native locking or transactions — we have to build concurrency safety on top of its primitives.
-
-## Key S3 primitives we rely on
-
-- **Atomic PUT** — a PUT either fully replaces the object or fails; readers never see partial writes
-- **Strong read-after-write consistency** — after a successful PUT, all subsequent GETs see the new content
-- **Conditional writes** — `If-Match: <etag>` gives us compare-and-swap; `If-None-Match: *` gives us write-if-not-exists
-- **Prefix-based listing** — `ListObjectsV2` with a prefix is efficient and strongly consistent
-
-## Key SQLite primitive: the session/changeset extension
+## session/changeset extension
 
 A **changeset** is a compact binary blob recording the before/after state of every row touched by a set of INSERTs/UPDATEs/DELETEs. It can be:
 
@@ -27,8 +9,6 @@ A **changeset** is a compact binary blob recording the before/after state of eve
 - **Concatenated** (merge multiple changesets)
 
 Applying a changeset to a database whose rows have diverged invokes a **conflict handler** with the specific mismatch (before-image doesn't match, row already exists, constraint violation, etc.). Requires tables to have explicit PRIMARY KEYs.
-
-The critical property: a changeset decouples *what changed* from *the full resulting state*, enabling log shipping and rebase-on-conflict.
 
 ---
 
@@ -153,36 +133,3 @@ The changeset rebase in the write retry path is **only safe with abort-on-confli
 - Cheap conflict *detection* when they don't, followed by a correct re-execution
 
 This is serializable isolation with optimistic concurrency control.
-
----
-
-## Properties
-
-| Property | Guarantee |
-|---|---|
-| **Atomicity** | A write is visible iff the manifest CAS succeeded. The manifest swap is atomic per S3 PUT semantics. |
-| **Consistency** | SQLite enforces constraints locally; the conflict handler rejects rebases that would violate the before-image check. |
-| **Isolation** | Serializable (via abort-on-conflict). Each successful write is equivalent to having executed on the exact state it overwrote. |
-| **Durability** | S3 provides 11 nines. Enable bucket versioning for point-in-time recovery of the manifest. |
-| **No corruption** | No partial writes (S3 atomic PUT). No torn reads (strong consistency). No lost updates (ETag CAS). |
-| **No single point of blocking** | Writers never wait on a lock; they race the CAS and rebase/retry on loss. |
-| **Cost at rest** | Storage only (~$0.023/GB-month). No idle compute. |
-| **Cost per op** | ~2 GETs + 2 PUTs per write; 1 GET (manifest) + 0–N GETs per read. Pennies per million ops. |
-
----
-
-## Limitations and scaling boundaries
-
-- **Hot-row contention** degrades to full transaction retry. If every writer updates the same row, throughput is ~1 write per RTT to S3 (single-digit per second). Fine for config/metadata stores; not for counters — use DynamoDB atomic increment for that.
-- **Cold-read latency** grows with log length. Mitigate by tuning compaction frequency.
-- **Snapshot size** — reading/writing a 50MB SQLite file from Lambda is slow. Past a few MB, consider sharding into multiple independent databases or moving to DynamoDB.
-- **Schema migrations** need coordination. Include a `schema_version` in the manifest and have writers refuse to write if their code's schema version doesn't match.
-
----
-
-## Future extensions
-
-- **Per-changeset table-touched metadata** in the manifest log entries — enables a fast-path conflict check ("does my changeset touch any table theirs did?") before attempting `changeset_apply`
-- **Named branches** — multiple manifests (`manifest-prod.json`, `manifest-staging.json`) pointing at overlapping blob sets
-- **Point-in-time reads** — keep historical manifests in a `history/` prefix; reading state at seq `N` is just loading the manifest where `seq == N`
-- **Read replicas** — other systems can reconstruct state by following the same manifest + log, no coordination needed
